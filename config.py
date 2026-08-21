@@ -6,7 +6,7 @@ from typing import List
 @dataclass
 class AppConfig:
     # Feature Toggles
-    enable_ambient_temp: bool = True
+    enable_ambient_temp: bool = False
     enable_power_supply: bool = True
     enable_rtd_heater: bool = True
     enable_live_plot: bool = True
@@ -25,7 +25,7 @@ class AppConfig:
 
     # Hardware Serial Ports
     ambient_temp_port: str = "/dev/ttyUSB1"
-    power_supply_port: str = "/dev/ttyUSB0"
+    power_supply_port: str = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AI03DT65-if00-port0"
 
     # DUT Power Configuration (CH2)
     dut_channel: int = 2

@@ -4,17 +4,24 @@ import pynanovna
 import logging
 import time
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("VNASuite")
 
 class VNADevice:
-    def __init__(self, start_freq: int, stop_freq: int, points: int):
+    def __init__(self, start_freq: int, stop_freq: int, points: int, port: str = None):
         self.start_freq = int(start_freq)
         self.stop_freq = int(stop_freq)
         self.points = int(points)
+        self.port = port
         self.vna = None
 
     def connect(self):
-        self.vna = pynanovna.VNA()
+        # Passing dev= explicitly targets the exact /dev/serial/by-id path
+        if self.port:
+            logger.info(f"Connecting to NanoVNA on {self.port}")
+            self.vna = pynanovna.VNA(dev=self.port)
+        else:
+            self.vna = pynanovna.VNA()
+
         self.vna.set_sweep(self.start_freq, self.stop_freq, self.points)
 
     def sweep(self, retries: int = 3, delay: float = 1.0):
@@ -33,5 +40,8 @@ class VNADevice:
         raise RuntimeError("VNA failed to complete sweep after retries.")
 
     def close(self):
-        if hasattr(self.vna, 'close'):
-            self.vna.close()
+        if self.vna and hasattr(self.vna, 'close'):
+            try:
+                self.vna.close()
+            except Exception:
+                pass

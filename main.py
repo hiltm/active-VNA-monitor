@@ -43,7 +43,12 @@ class ExperimentController:
             # 1. NanoVNA
             if not self.vna:
                 self.logger.info("Connecting to VNA...")
-                self.vna = VNADevice(self.cfg.start_freq, self.cfg.stop_freq, self.cfg.points)
+                self.vna = VNADevice(
+                    start_freq=self.cfg.start_freq,
+                    stop_freq=self.cfg.stop_freq,
+                    points=self.cfg.points,
+                    port=self.cfg.vna_port
+                )
                 self.vna.connect()
 
             # 2. Ambient Sensor
