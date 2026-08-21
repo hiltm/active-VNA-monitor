@@ -2,110 +2,124 @@
 import logging
 from pathlib import Path
 import numpy as np
+import joblib
 from core.models import MeasurementRecord
 
 logger = logging.getLogger("VNASuite")
 
-class MLEngine:
-    """Loads a pre-trained ML model and runs inference on incoming VNA sweeps."""
+CLASS_LABELS = {
+    0: 'Fresh (Baseline)',
+    1: 'Lightly Aged (Days 1-3)',
+    2: 'Heavily Aged (Days 4+)',
+}
 
-    def __init__(self, model_path: str, threshold: float = 0.85, feature_type: str = "magnitude_db"):
-        self.model_path = Path(model_path)
-        self.threshold = threshold
-        self.feature_type = feature_type
+N_FREQ_POINTS = 201
+
+
+class RFAgingClassifier:
+    """RF Reflectometry Board Aging Classifier for 3-class tamper/aging inference."""
+
+    def __init__(self, model_dir: str, model_type: str = 'rf'):
+        self.model_dir = Path(model_dir)
+        self.model_type = model_type
         self.model = None
-        self.model_type = None
+        self.scaler = None
+        self.metadata = None
 
     def load_model(self):
-        """Loads ONNX, TFLite, Joblib (scikit-learn), or PyTorch models."""
-        if not self.model_path.exists():
-            raise FileNotFoundError(f"ML Model file not found at {self.model_path}")
+        """Loads the trained classifier, StandardScaler, and training metadata."""
+        model_path = self.model_dir / f"{self.model_type}_model.joblib"
+        scaler_path = self.model_dir / "scaler.joblib"
+        metadata_path = self.model_dir / "training_metadata.joblib"
 
-        ext = self.model_path.suffix.lower()
-        
-        if ext == ".onnx":
-            import onnxruntime as ort
-            self.model = ort.InferenceSession(str(self.model_path))
-            self.model_type = "onnx"
-        elif ext in [".tflite"]:
-            try:
-                import tflite_runtime.interpreter as tflite
-            except ImportError:
-                from tensorflow import lite as tflite
-            self.model = tflite.Interpreter(model_path=str(self.model_path))
-            self.model.allocate_tensors()
-            self.model_type = "tflite"
-        elif ext in [".pkl", ".joblib"]:
-            import joblib
-            self.model = joblib.load(self.model_path)
-            self.model_type = "sklearn"
-        elif ext in [".pt", ".pth"]:
-            import torch
-            self.model = torch.jit.load(str(self.model_path))
-            self.model.eval()
-            self.model_type = "torch"
-        else:
-            raise ValueError(f"Unsupported model format: {ext}")
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        if not scaler_path.exists():
+            raise FileNotFoundError(f"Scaler file not found: {scaler_path}")
 
-        logger.info(f"Loaded {self.model_type.upper()} model from {self.model_path.name}")
+        self.model = joblib.load(model_path)
+        self.scaler = joblib.load(scaler_path)
 
-    def extract_features(self, record: MeasurementRecord) -> np.ndarray:
-        """Transforms raw S-parameters into model input feature vectors."""
-        eps = 1e-12
-        if self.feature_type == "magnitude_db":
-            s11_db = 20 * np.log10(np.abs(record.s11) + eps)
-            s21_db = 20 * np.log10(np.abs(record.s21) + eps)
-            features = np.concatenate([s11_db, s21_db])
-        elif self.feature_type == "complex_iq":
-            features = np.concatenate([
-                np.real(record.s11), np.imag(record.s11),
-                np.real(record.s21), np.imag(record.s21)
-            ])
-        else:  # Magnitude + Phase
-            features = np.concatenate([
-                np.abs(record.s11), np.angle(record.s11),
-                np.abs(record.s21), np.angle(record.s21)
-            ])
-        
-        return features.astype(np.float32).reshape(1, -1)
+        if metadata_path.exists():
+            self.metadata = joblib.load(metadata_path)
 
-    def evaluate(self, record: MeasurementRecord) -> tuple[float, bool]:
+        logger.info(f"Loaded {self.model_type.upper()} model and StandardScaler from {self.model_dir}")
+
+    @staticmethod
+    def extract_features(s11_complex: np.ndarray, s21_complex: np.ndarray, freqs: np.ndarray = None) -> np.ndarray:
         """
-        Runs inference on the sweep record.
-        Returns: (anomaly_score [0.0 to 1.0], is_anomaly [bool])
+        Extracts the full 1,612-element feature vector from complex S11 and S21 arrays.
+        Matches train_classifier.py and classify_measurement.py.
         """
-        if self.model is None:
-            return 0.0, False
+        if freqs is None:
+            freqs = np.linspace(1e6, 4e9, N_FREQ_POINTS)
 
-        features = self.extract_features(record)
+        # Magnitude in dB
+        s11_mag_db = 20 * np.log10(np.maximum(np.abs(s11_complex), 1e-10))
+        s21_mag_db = 20 * np.log10(np.maximum(np.abs(s21_complex), 1e-10))
 
-        try:
-            if self.model_type == "onnx":
-                input_name = self.model.get_inputs()[0].name
-                outputs = self.model.run(None, {input_name: features})
-                score = float(outputs[0][0])
-            elif self.model_type == "tflite":
-                input_details = self.model.get_input_details()
-                output_details = self.model.get_output_details()
-                self.model.set_tensor(input_details[0]['index'], features)
-                self.model.invoke()
-                score = float(self.model.get_tensor(output_details[0]['index'])[0])
-            elif self.model_type == "sklearn":
-                if hasattr(self.model, "predict_proba"):
-                    score = float(self.model.predict_proba(features)[0][1])
-                elif hasattr(self.model, "decision_function"):
-                    score = float(self.model.decision_function(features)[0])
-                else:  # Autoencoders / IsolationForest
-                    score = float(-self.model.score_samples(features)[0])
-            elif self.model_type == "torch":
-                import torch
-                with torch.no_grad():
-                    tensor_in = torch.from_numpy(features)
-                    score = float(self.model(tensor_in)[0].item())
+        # Phase in degrees
+        s11_phase = np.angle(s11_complex, deg=True)
+        s21_phase = np.angle(s21_complex, deg=True)
 
-            is_anomaly = score >= self.threshold
-            return score, is_anomaly
+        # Group delay: -d(unwrapped_phase)/d(freq) in nanoseconds
+        s11_phase_unwrap = np.unwrap(np.angle(s11_complex))
+        s21_phase_unwrap = np.unwrap(np.angle(s21_complex))
+        freq_diff = np.diff(freqs)
+        s11_group_delay_ns = -np.diff(s11_phase_unwrap) / (2 * np.pi * freq_diff) * 1e9
+        s21_group_delay_ns = -np.diff(s21_phase_unwrap) / (2 * np.pi * freq_diff) * 1e9
 
-        except Exception as e:
-            logger.error(f"Error during ML inference: {e}")
-            return 0.0, False
+        # Magnitude slope: d(mag_dB)/d(freq_GHz)
+        freq_diff_ghz = freq_diff / 1e9
+        s11_mag_slope = np.diff(s11_mag_db) / freq_diff_ghz
+        s21_mag_slope = np.diff(s21_mag_db) / freq_diff_ghz
+
+        # Statistical summaries
+        stats = np.array([
+            np.mean(s11_mag_db), np.std(s11_mag_db),
+            np.mean(s21_mag_db), np.std(s21_mag_db),
+            np.mean(s11_phase), np.std(s11_phase),
+            np.mean(s21_phase), np.std(s21_phase),
+        ])
+
+        features = np.concatenate([
+            s11_mag_db, s11_phase, s21_mag_db, s21_phase,
+            s11_group_delay_ns, s21_group_delay_ns,
+            s11_mag_slope, s21_mag_slope,
+            stats,
+        ])
+        return features
+
+    def evaluate(self, record: MeasurementRecord) -> dict:
+        """
+        Runs real-time inference on a MeasurementRecord.
+        Returns class id, label, confidence score, and probability distribution.
+        """
+        if self.model is None or self.scaler is None:
+            return {
+                'class': None,
+                'label': 'Model Not Loaded',
+                'confidence': 0.0,
+                'probabilities': [0.0, 0.0, 0.0]
+            }
+
+        # Extract 1612 features and apply standard scaling
+        raw_features = self.extract_features(record.s11, record.s21, record.freqs)
+        features_scaled = self.scaler.transform(raw_features.reshape(1, -1))
+
+        # Predict class
+        predicted_class = int(self.model.predict(features_scaled)[0])
+
+        probabilities = [0.0, 0.0, 0.0]
+        confidence = 0.0
+        if hasattr(self.model, 'predict_proba'):
+            probs = self.model.predict_proba(features_scaled)[0]
+            probabilities = [float(p) for p in probs]
+            confidence = float(probabilities[predicted_class])
+
+        return {
+            'class': predicted_class,
+            'label': CLASS_LABELS.get(predicted_class, f"Class {predicted_class}"),
+            'confidence': confidence,
+            'probabilities': probabilities,
+        }

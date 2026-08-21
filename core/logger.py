@@ -9,7 +9,6 @@ from datetime import datetime
 from typing import Any, Dict
 
 class ResilientFileHandler(logging.FileHandler):
-    """FileHandler that automatically rolls over to a fallback log file if write/open fails."""
     def __init__(self, filename: Path, encoding: str = "utf-8"):
         self.base_path = Path(filename)
         self.current_path = self.base_path
@@ -24,7 +23,7 @@ class ResilientFileHandler(logging.FileHandler):
         except (PermissionError, OSError):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             fallback = target_path.parent / f"{target_path.stem}_fallback_{ts}{target_path.suffix}"
-            print(f"[LOGGER WARNING] Cannot write to {target_path.name}. Redirecting log to {fallback.name}")
+            print(f"[LOGGER WARNING] Cannot write to {target_path.name}. Redirecting to {fallback.name}")
             return fallback
 
     def emit(self, record: logging.LogRecord):
@@ -32,7 +31,6 @@ class ResilientFileHandler(logging.FileHandler):
             super().emit(record)
         except (PermissionError, OSError, IOError):
             self.handleError(record)
-            # Re-point to a new writable file
             self.close()
             self.current_path = self._get_writable_path(self.base_path)
             self.baseFilename = str(self.current_path)
@@ -41,7 +39,6 @@ class ResilientFileHandler(logging.FileHandler):
 
 
 def setup_system_logger(log_dir: Path, experiment_name: str) -> logging.Logger:
-    """Configures non-propagating console output and resilient event logging."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"{experiment_name}_events.log"
 
@@ -52,25 +49,20 @@ def setup_system_logger(log_dir: Path, experiment_name: str) -> logging.Logger:
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # Resilient File Handler
     fh = ResilientFileHandler(log_file)
     fh.setLevel(logging.DEBUG)
-    fh_formatter = logging.Formatter(
+    fh.setFormatter(logging.Formatter(
         "%(asctime)s.%(msecs)03d [%(levelname)s] [%(name)s:%(lineno)d]: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    fh.setFormatter(fh_formatter)
+    ))
 
-    # Console Stream Handler
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
-    ch_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-    ch.setFormatter(ch_formatter)
+    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
 
     logger.addHandler(fh)
     logger.addHandler(ch)
 
-    # Suppress external library spam
     logging.getLogger("pynanovna").setLevel(logging.ERROR)
     logging.getLogger("pynanovna.hardware.Hardware").setLevel(logging.ERROR)
 
@@ -78,13 +70,13 @@ def setup_system_logger(log_dir: Path, experiment_name: str) -> logging.Logger:
 
 
 class ExperimentTelemetryLogger:
-    """Writes synchronized CSV telemetry with automatic file-redirection on write collision."""
-    
     CSV_HEADERS = [
         "iso_time", "epoch_time", "touchstone_file", "touchstone_sha256",
         "ambient_temp_c", "rtd_setpoint_c", "rtd_measured_temp_c", "rtd_resistance_ohm",
         "rtd_current_a", "rtd_voltage_v", "rtd_phase", "dut_voltage_v", 
-        "dut_current_ma", "dut_power_mw", "anomaly_score", "anomaly_flag"
+        "dut_current_ma", "dut_power_mw",
+        "ml_class", "ml_label", "ml_confidence",
+        "ml_prob_fresh", "ml_prob_light_aged", "ml_prob_heavy_aged"
     ]
 
     def __init__(self, output_dir: Path, experiment_name: str, config_snapshot: dict):
@@ -126,7 +118,6 @@ class ExperimentTelemetryLogger:
                 self._rollover_csv()
 
     def _rollover_csv(self):
-        """Switches to a fresh timestamped CSV file when the primary is blocked."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_path = self.output_dir / f"{self.experiment_name}_telemetry_fallback_{ts}.csv"
         with open(self.csv_path, mode="w", newline="", encoding="utf-8") as f:
@@ -146,8 +137,7 @@ class ExperimentTelemetryLogger:
             return "HASH_ERROR"
 
     def log_sweep(self, row_data: Dict[str, Any]):
-        """Writes one telemetry row, automatically rolling over if the current file is locked."""
-        for attempt in range(2):
+        for _ in range(2):
             try:
                 with open(self.csv_path, mode="a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=self.CSV_HEADERS)

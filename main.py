@@ -15,7 +15,7 @@ from drivers.gpd2303s import GPD2303S
 from drivers.dut_power import DUTPowerController
 from drivers.rtd_heater import RTDHeaterController
 from ui.visualizer import LivePlotter
-from plugins.ml_engine import MLEngine
+from plugins.ml_engine import RFAgingClassifier
 
 
 class ExperimentController:
@@ -31,14 +31,14 @@ class ExperimentController:
         )
         self.storage = DataStorage(cfg.base_save_dir, cfg.experiment_name)
 
-        # Hardware and Subsystem Handles
+        # Hardware & Plugin Handles
         self.vna = None
         self.ambient_sensor = None
         self.psu = None
         self.dut = None
         self.heater = None
         self.plotter = None
-        self.ml_engine = None
+        self.ml_classifier = None
 
     def connect_all_hardware(self, is_recovery: bool = False) -> bool:
         """Initializes and connects all active experimental subsystems."""
@@ -98,15 +98,14 @@ class ExperimentController:
             if self.cfg.enable_live_plot and not self.plotter:
                 self.plotter = LivePlotter(self.cfg.start_freq, self.cfg.stop_freq)
 
-            # 5. Machine Learning Inference Engine
-            if self.cfg.enable_ml_evaluation and not self.ml_engine:
-                self.logger.info(f"Loading ML model from {self.cfg.ml_model_path}...")
-                self.ml_engine = MLEngine(
-                    model_path=self.cfg.ml_model_path,
-                    threshold=self.cfg.ml_threshold,
-                    feature_type=self.cfg.ml_feature_type
+            # 5. RF Reflectometry Aging ML Classifier
+            if self.cfg.enable_ml_evaluation and not self.ml_classifier:
+                self.logger.info(f"Loading {self.cfg.ml_model_type.upper()} classifier from {self.cfg.ml_model_dir}...")
+                self.ml_classifier = RFAgingClassifier(
+                    model_dir=self.cfg.ml_model_dir,
+                    model_type=self.cfg.ml_model_type
                 )
-                self.ml_engine.load_model()
+                self.ml_classifier.load_model()
 
             if is_recovery:
                 self.logger.info(">>> RECOVERY SUCCESSFUL: All instruments restored and online. <<<")
@@ -144,7 +143,6 @@ class ExperimentController:
         self.logger.error(">>> POWER/COMMUNICATION INTERRUPTION DETECTED. Entering recovery loop... <<<")
         self.disconnect_all(silent=True)
 
-        # Log power drop event marker to telemetry
         self.telemetry.log_sweep({
             "iso_time": datetime.now().isoformat(),
             "epoch_time": time.time(),
@@ -160,15 +158,18 @@ class ExperimentController:
             "dut_voltage_v": None,
             "dut_current_ma": None,
             "dut_power_mw": None,
-            "anomaly_score": 1.0,
-            "anomaly_flag": True
+            "ml_class": None,
+            "ml_label": "OFFLINE",
+            "ml_confidence": None,
+            "ml_prob_fresh": None,
+            "ml_prob_light_aged": None,
+            "ml_prob_heavy_aged": None
         })
 
         retry_count = 1
         while True:
             self.logger.info(f"Recovery attempt #{retry_count}: verifying instrument availability...")
             if self.connect_all_hardware(is_recovery=True):
-                # Log successful recovery event
                 self.telemetry.log_sweep({
                     "iso_time": datetime.now().isoformat(),
                     "epoch_time": time.time(),
@@ -184,8 +185,12 @@ class ExperimentController:
                     "dut_voltage_v": None,
                     "dut_current_ma": None,
                     "dut_power_mw": None,
-                    "anomaly_score": 0.0,
-                    "anomaly_flag": False
+                    "ml_class": None,
+                    "ml_label": "RESUMED",
+                    "ml_confidence": None,
+                    "ml_prob_fresh": None,
+                    "ml_prob_light_aged": None,
+                    "ml_prob_heavy_aged": None
                 })
                 break
             retry_count += 1
@@ -194,7 +199,6 @@ class ExperimentController:
     def run(self):
         self.logger.info(f"Starting experiment suite: {self.cfg.experiment_name}")
         
-        # Initial boot connection loop
         while not self.connect_all_hardware():
             self.logger.warning("Hardware not ready on boot. Retrying in 5 seconds...")
             time.sleep(5.0)
@@ -246,18 +250,24 @@ class ExperimentController:
                 s2p_path = self.storage.save_record(record)
                 file_hash = ExperimentTelemetryLogger.compute_sha256(s2p_path)
 
-                # 7. Real-Time Machine Learning Anomaly Evaluation
-                anomaly_score = 0.0
-                anomaly_flag = False
-                if self.ml_engine:
-                    anomaly_score, anomaly_flag = self.ml_engine.evaluate(record)
-                    if anomaly_flag:
-                        self.logger.warning(
-                            f"ANOMALY DETECTED in {s2p_path.name} | Score: {anomaly_score:.4f} "
-                            f"(Threshold: {self.cfg.ml_threshold})"
-                        )
+                # 7. Real-Time ML Aging Classification
+                ml_res = {
+                    'class': None,
+                    'label': 'Disabled',
+                    'confidence': None,
+                    'probabilities': [None, None, None]
+                }
+                if self.ml_classifier:
+                    ml_res = self.ml_classifier.evaluate(record)
+                    self.logger.info(
+                        f"Inference: Class {ml_res['class']} ({ml_res['label']}) | "
+                        f"Conf: {ml_res['confidence']:.1%} | "
+                        f"P(C0)={ml_res['probabilities'][0]:.2f} "
+                        f"P(C1)={ml_res['probabilities'][1]:.2f} "
+                        f"P(C2)={ml_res['probabilities'][2]:.2f}"
+                    )
 
-                # 8. Append Row to Synchronized CSV Telemetry
+                # 8. Append Synchronized Telemetry Row
                 self.telemetry.log_sweep({
                     "iso_time": t_dt.isoformat(),
                     "epoch_time": t_epoch,
@@ -273,8 +283,12 @@ class ExperimentController:
                     "dut_voltage_v": dut_stats.get("dut_voltage_v"),
                     "dut_current_ma": (dut_stats.get("dut_current_a") or 0.0) * 1000,
                     "dut_power_mw": (dut_stats.get("dut_power_w") or 0.0) * 1000,
-                    "anomaly_score": anomaly_score,
-                    "anomaly_flag": anomaly_flag
+                    "ml_class": ml_res['class'],
+                    "ml_label": ml_res['label'],
+                    "ml_confidence": ml_res['confidence'],
+                    "ml_prob_fresh": ml_res['probabilities'][0],
+                    "ml_prob_light_aged": ml_res['probabilities'][1],
+                    "ml_prob_heavy_aged": ml_res['probabilities'][2]
                 })
 
                 # 9. Update Live Plotter GUI

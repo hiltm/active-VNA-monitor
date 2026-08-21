@@ -1,6 +1,5 @@
 # config.py
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import List
 
 @dataclass
@@ -15,9 +14,8 @@ class AppConfig:
     enable_blockchain_sync: bool = False
 
     # ML Inference Settings
-    ml_model_path: str = "/home/chiptamper/chiptamper/models/vna_anomaly_detector.onnx"
-    ml_threshold: float = 0.85
-    ml_feature_type: str = "magnitude_db"
+    ml_model_dir: str = "/home/chiptamper/chiptamper/git/active-VNA-monitor/models"
+    ml_model_type: str = "rf"  # Options: 'rf', 'knn', 'svm'
 
     # Experiment Loop Parameters
     loop_interval_seconds: float = 1.0
