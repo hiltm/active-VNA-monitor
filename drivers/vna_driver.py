@@ -15,11 +15,28 @@ class VNADevice:
         self.vna = None
 
     def connect(self):
-        # Passing dev= explicitly targets the exact /dev/serial/by-id path
+        self.vna = None
+
         if self.port:
             logger.info(f"Connecting to NanoVNA on {self.port}")
-            self.vna = pynanovna.VNA(dev=self.port)
-        else:
+            # Try various constructor signatures accepted by different pynanovna versions
+            for init_call in [
+                lambda: pynanovna.VNA(self.port),          # Positional argument
+                lambda: pynanovna.VNA(device=self.port),    # device keyword
+                lambda: pynanovna.VNA(port=self.port),      # port keyword
+            ]:
+                try:
+                    self.vna = init_call()
+                    break
+                except TypeError:
+                    continue
+                except Exception as e:
+                    logger.warning(f"Port connection attempt failed: {e}")
+                    break
+
+        # Fallback to pynanovna native USB VID/PID auto-discovery
+        if self.vna is None:
+            logger.info("Using pynanovna native auto-detection...")
             self.vna = pynanovna.VNA()
 
         self.vna.set_sweep(self.start_freq, self.stop_freq, self.points)
