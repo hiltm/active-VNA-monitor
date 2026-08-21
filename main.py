@@ -15,6 +15,7 @@ from drivers.gpd2303s import GPD2303S
 from drivers.dut_power import DUTPowerController
 from drivers.rtd_heater import RTDHeaterController
 from ui.visualizer import LivePlotter
+from plugins.ml_engine import MLEngine
 
 
 class ExperimentController:
@@ -30,19 +31,21 @@ class ExperimentController:
         )
         self.storage = DataStorage(cfg.base_save_dir, cfg.experiment_name)
 
+        # Hardware and Subsystem Handles
         self.vna = None
         self.ambient_sensor = None
         self.psu = None
         self.dut = None
         self.heater = None
         self.plotter = None
+        self.ml_engine = None
 
     def connect_all_hardware(self, is_recovery: bool = False) -> bool:
-        """Attempts to initialize and configure all active instruments."""
+        """Initializes and connects all active experimental subsystems."""
         try:
-            # 1. NanoVNA
+            # 1. NanoVNA Connection
             if not self.vna:
-                self.logger.info("Connecting to VNA...")
+                self.logger.info(f"Connecting to NanoVNA (Port: {self.cfg.vna_port})...")
                 self.vna = VNADevice(
                     start_freq=self.cfg.start_freq,
                     stop_freq=self.cfg.stop_freq,
@@ -51,25 +54,29 @@ class ExperimentController:
                 )
                 self.vna.connect()
 
-            # 2. Ambient Sensor
+            # 2. Ambient Sensor Connection
             if self.cfg.enable_ambient_temp and not self.ambient_sensor:
                 self.logger.info(f"Connecting to ambient sensor on {self.cfg.ambient_temp_port}...")
                 self.ambient_sensor = TemperatureSensor(port=self.cfg.ambient_temp_port)
                 self.ambient_sensor.connect()
 
-            # 3. Power Supply & Sub-Controllers
+            # 3. Dual-Channel Power Supply & Sub-Controllers
             if (self.cfg.enable_power_supply or self.cfg.enable_rtd_heater) and not self.psu:
                 self.logger.info(f"Connecting to PSU on {self.cfg.power_supply_port}...")
                 self.psu = GPD2303S(port=self.cfg.power_supply_port)
                 self.psu.connect()
 
+                # DUT Channel (CH2)
                 if self.cfg.enable_power_supply:
                     self.dut = DUTPowerController(self.psu, channel=self.cfg.dut_channel)
                     self.dut.power_on(voltage=self.cfg.dut_voltage, current_limit=self.cfg.dut_current_limit)
-                    self.logger.info(f"DUT power restored on CH{self.cfg.dut_channel}.")
+                    self.logger.info(
+                        f"DUT power active on CH{self.cfg.dut_channel} "
+                        f"({self.cfg.dut_voltage}V, {self.cfg.dut_current_limit}A)."
+                    )
 
+                # RTD Heating Element (CH1)
                 if self.cfg.enable_rtd_heater:
-                    # Preserve existing PID/schedule state if recovering
                     if not self.heater:
                         self.heater = RTDHeaterController(
                             psu=self.psu,
@@ -77,31 +84,43 @@ class ExperimentController:
                             dwell_seconds=self.cfg.rtd_dwell_seconds,
                             tolerance=self.cfg.rtd_tolerance,
                             stable_samples=self.cfg.rtd_stable_samples,
-                            kp=self.cfg.rtd_kp, ki=self.cfg.rtd_ki, kd=self.cfg.rtd_kd
+                            kp=self.cfg.rtd_kp,
+                            ki=self.cfg.rtd_ki,
+                            kd=self.cfg.rtd_kd
                         )
                     else:
                         self.heater.psu = self.psu
                     
                     self.heater.initialize_hardware()
-                    self.logger.info(f"RTD Heater re-initialized on CH{self.heater.CHANNEL}.")
+                    self.logger.info(f"RTD Heater initialized on CH{self.heater.CHANNEL}.")
 
-            # 4. Plotter
+            # 4. Live GUI Visualizer
             if self.cfg.enable_live_plot and not self.plotter:
                 self.plotter = LivePlotter(self.cfg.start_freq, self.cfg.stop_freq)
 
+            # 5. Machine Learning Inference Engine
+            if self.cfg.enable_ml_evaluation and not self.ml_engine:
+                self.logger.info(f"Loading ML model from {self.cfg.ml_model_path}...")
+                self.ml_engine = MLEngine(
+                    model_path=self.cfg.ml_model_path,
+                    threshold=self.cfg.ml_threshold,
+                    feature_type=self.cfg.ml_feature_type
+                )
+                self.ml_engine.load_model()
+
             if is_recovery:
-                self.logger.info(">>> RECOVERY SUCCESSFUL: All hardware re-armed and online. <<<")
+                self.logger.info(">>> RECOVERY SUCCESSFUL: All instruments restored and online. <<<")
             return True
 
         except Exception as e:
-            self.logger.warning(f"Connection attempt failed: {e}")
+            self.logger.warning(f"Subsystem initialization failed: {e}")
             self.disconnect_all(silent=True)
             return False
 
     def disconnect_all(self, silent: bool = False):
-        """Safely closes connections to allow clean re-opening."""
+        """Safely shuts off power outputs and releases OS serial communication ports."""
         if not silent:
-            self.logger.info("Releasing hardware handles...")
+            self.logger.info("Closing all active hardware handles...")
         try:
             if self.dut: self.dut.power_off()
         except Exception: pass
@@ -121,11 +140,11 @@ class ExperimentController:
         self.vna = None
 
     def wait_for_hardware_recovery(self, poll_interval: float = 3.0):
-        """Blocks and polls until dropped instruments are back online."""
-        self.logger.error(">>> POWER/COMMUNICATION LOSS DETECTED. Entering recovery loop... <<<")
+        """Blocks execution and polls until power-cycled hardware becomes reachable again."""
+        self.logger.error(">>> POWER/COMMUNICATION INTERRUPTION DETECTED. Entering recovery loop... <<<")
         self.disconnect_all(silent=True)
 
-        # Log power event marker to CSV
+        # Log power drop event marker to telemetry
         self.telemetry.log_sweep({
             "iso_time": datetime.now().isoformat(),
             "epoch_time": time.time(),
@@ -147,9 +166,9 @@ class ExperimentController:
 
         retry_count = 1
         while True:
-            self.logger.info(f"Recovery attempt #{retry_count}: checking instrument availability...")
+            self.logger.info(f"Recovery attempt #{retry_count}: verifying instrument availability...")
             if self.connect_all_hardware(is_recovery=True):
-                # Log recovery event to CSV
+                # Log successful recovery event
                 self.telemetry.log_sweep({
                     "iso_time": datetime.now().isoformat(),
                     "epoch_time": time.time(),
@@ -173,7 +192,7 @@ class ExperimentController:
             time.sleep(poll_interval)
 
     def run(self):
-        self.logger.info(f"Initializing experiment suite: {self.cfg.experiment_name}")
+        self.logger.info(f"Starting experiment suite: {self.cfg.experiment_name}")
         
         # Initial boot connection loop
         while not self.connect_all_hardware():
@@ -181,7 +200,7 @@ class ExperimentController:
             time.sleep(5.0)
 
         start_time = time.monotonic()
-        self.logger.info("Starting acquisition loop. Press Ctrl+C to abort.")
+        self.logger.info("Entering active acquisition loop. Press Ctrl+C to stop.")
 
         try:
             while True:
@@ -190,28 +209,28 @@ class ExperimentController:
                 t_dt = datetime.now()
 
                 try:
-                    # 1. Update Ambient Temperature
+                    # 1. Read Ambient Sensor
                     ambient_val = self.ambient_sensor.read_temperature() if self.ambient_sensor else None
 
-                    # 2. Update Heater State Machine
+                    # 2. Update Thermal Stepped PID Loop
                     heater_stats = {}
                     if self.heater:
                         heater_stats = self.heater.update_tick(t_now_s)
 
-                    # 3. Read DUT Telemetry
+                    # 3. Read DUT Power Consumption
                     dut_stats = {}
                     if self.dut:
                         dut_stats = self.dut.read_telemetry()
 
-                    # 4. Execute VNA RF Sweep
+                    # 4. Perform VNA RF Sweep
                     freqs, s11, s21, s12, s22 = self.vna.sweep()
 
                 except Exception as hw_err:
-                    self.logger.error(f"Instrument communication error during sweep: {hw_err}")
+                    self.logger.error(f"Hardware communication failure: {hw_err}")
                     self.wait_for_hardware_recovery()
                     continue
 
-                # 5. Encapsulate Data Record
+                # 5. Pack Measurement Record
                 record = MeasurementRecord(
                     timestamp=t_dt,
                     freqs=freqs,
@@ -223,11 +242,22 @@ class ExperimentController:
                     power_state={**dut_stats, "rtd_stats": heater_stats}
                 )
 
-                # 6. Save Data Artifact (.s2p) & Checksum
+                # 6. Save Touchstone File (.s2p) & Checksum
                 s2p_path = self.storage.save_record(record)
                 file_hash = ExperimentTelemetryLogger.compute_sha256(s2p_path)
 
-                # 7. Log Synchronized Telemetry Row
+                # 7. Real-Time Machine Learning Anomaly Evaluation
+                anomaly_score = 0.0
+                anomaly_flag = False
+                if self.ml_engine:
+                    anomaly_score, anomaly_flag = self.ml_engine.evaluate(record)
+                    if anomaly_flag:
+                        self.logger.warning(
+                            f"ANOMALY DETECTED in {s2p_path.name} | Score: {anomaly_score:.4f} "
+                            f"(Threshold: {self.cfg.ml_threshold})"
+                        )
+
+                # 8. Append Row to Synchronized CSV Telemetry
                 self.telemetry.log_sweep({
                     "iso_time": t_dt.isoformat(),
                     "epoch_time": t_epoch,
@@ -243,21 +273,22 @@ class ExperimentController:
                     "dut_voltage_v": dut_stats.get("dut_voltage_v"),
                     "dut_current_ma": (dut_stats.get("dut_current_a") or 0.0) * 1000,
                     "dut_power_mw": (dut_stats.get("dut_power_w") or 0.0) * 1000,
-                    "anomaly_score": 0.0,
-                    "anomaly_flag": False
+                    "anomaly_score": anomaly_score,
+                    "anomaly_flag": anomaly_flag
                 })
 
-                # 8. Update UI
+                # 9. Update Live Plotter GUI
                 if self.plotter:
                     self.plotter.update(record)
 
                 time.sleep(self.cfg.loop_interval_seconds)
 
         except KeyboardInterrupt:
-            self.logger.info("Experiment stopped by user.")
+            self.logger.info("Acquisition interrupted by user.")
         finally:
             self.disconnect_all()
-            if self.plotter: self.plotter.close()
+            if self.plotter:
+                self.plotter.close()
             self.logger.info("Suite shutdown complete.")
 
 

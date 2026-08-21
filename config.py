@@ -11,7 +11,13 @@ class AppConfig:
     enable_rtd_heater: bool = True
     enable_live_plot: bool = True
     enable_anomaly_detection: bool = False
+    enable_ml_evaluation: bool = True
     enable_blockchain_sync: bool = False
+
+    # ML Inference Settings
+    ml_model_path: str = "/home/chiptamper/chiptamper/models/vna_anomaly_detector.onnx"
+    ml_threshold: float = 0.85
+    ml_feature_type: str = "magnitude_db"
 
     # Experiment Loop Parameters
     loop_interval_seconds: float = 1.0
