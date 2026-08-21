@@ -37,6 +37,11 @@ def setup_system_logger(log_dir: Path, experiment_name: str) -> logging.Logger:
 
     logger.addHandler(fh)
     logger.addHandler(ch)
+
+    # Mute external driver noise
+    logging.getLogger("pynanovna").setLevel(logging.ERROR)
+    logging.getLogger("pynanovna.hardware.Hardware").setLevel(logging.ERROR)
+
     return logger
 
 
