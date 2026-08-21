@@ -16,6 +16,7 @@ def setup_system_logger(log_dir: Path, experiment_name: str) -> logging.Logger:
 
     logger = logging.getLogger("VNASuite")
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
     # Avoid duplicate handlers on multiple initializations
     if logger.hasHandlers():
