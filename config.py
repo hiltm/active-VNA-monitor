@@ -24,8 +24,9 @@ class AppConfig:
     points: int = 201
 
     # Hardware Serial Ports
-    ambient_temp_port: str = "/dev/ttyUSB1"
+    vna_port: str = "/dev/serial/by-id/usb-SYSJOINT_NanoVnaPro_Virtual_ComPort_00000000001A-if00"
     power_supply_port: str = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AI03DT65-if00-port0"
+    ambient_temp_port: str = "/dev/ttyUSB1"
 
     # DUT Power Configuration (CH2)
     dut_channel: int = 2
