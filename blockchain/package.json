@@ -1,0 +1,14 @@
+{
+  "name": "vna-monitor-data-registry",
+  "version": "2.0.0",
+  "description": "Local Hardhat project: DataRegistry provenance contract for the active-VNA-monitor suite. Compile + deploy only; records are committed live by the Python plugin.",
+  "scripts": {
+    "compile": "hardhat compile",
+    "node": "hardhat node",
+    "deploy": "hardhat run scripts/deploy.js --network localhost"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.22.19"
+  }
+}

@@ -17,6 +17,16 @@ class AppConfig:
     ml_model_dir: str = "/home/chiptamper/chiptamper/git/active-VNA-monitor/models"
     ml_model_type: str = "rf"  # Options: 'rf', 'knn', 'svm'
 
+    # Blockchain Provenance Ledger (used when enable_blockchain_sync = True)
+    blockchain_rpc_url: str = "http://127.0.0.1:8545"
+    # Path to the Hardhat deploy artifact written by `npm run deploy`.
+    blockchain_contract_address_file: str = (
+        "/home/chiptamper/chiptamper/git/active-VNA-monitor/"
+        "blockchain/artifacts_on_chain/contract-address.json"
+    )
+    blockchain_chain_id: int | None = None       # None = auto-detect from node
+    blockchain_private_key: str | None = None    # None = use node-unlocked account (Hardhat default)
+
     # Experiment Loop Parameters
     loop_interval_seconds: float = 1.0
     base_save_dir: str = "/home/chiptamper/chiptamper/data"

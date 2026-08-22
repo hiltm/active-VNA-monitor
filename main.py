@@ -16,6 +16,7 @@ from drivers.dut_power import DUTPowerController
 from drivers.rtd_heater import RTDHeaterController
 from ui.visualizer import LivePlotter
 from plugins.ml_engine import RFAgingClassifier
+from plugins.blockchain_ledger import BlockchainLedger
 
 
 class ExperimentController:
@@ -39,6 +40,7 @@ class ExperimentController:
         self.heater = None
         self.plotter = None
         self.ml_classifier = None
+        self.ledger = None
 
     def connect_all_hardware(self, is_recovery: bool = False) -> bool:
         """Initializes and connects all active experimental subsystems."""
@@ -107,6 +109,19 @@ class ExperimentController:
                 )
                 self.ml_classifier.load_model()
 
+            # 6. Blockchain Provenance Ledger
+            if self.cfg.enable_blockchain_sync and not self.ledger:
+                self.logger.info(
+                    f"Connecting to blockchain ledger at {self.cfg.blockchain_rpc_url}..."
+                )
+                self.ledger = BlockchainLedger(
+                    rpc_url=self.cfg.blockchain_rpc_url,
+                    contract_address_file=self.cfg.blockchain_contract_address_file,
+                    chain_id=self.cfg.blockchain_chain_id,
+                    private_key=self.cfg.blockchain_private_key,
+                )
+                self.ledger.connect()
+
             if is_recovery:
                 self.logger.info(">>> RECOVERY SUCCESSFUL: All instruments restored and online. <<<")
             return True
@@ -133,10 +148,15 @@ class ExperimentController:
             if self.vna: self.vna.close()
         except Exception: pass
 
+        try:
+            if self.ledger: self.ledger.close()
+        except Exception: pass
+
         self.psu = None
         self.dut = None
         self.ambient_sensor = None
         self.vna = None
+        self.ledger = None
 
     def wait_for_hardware_recovery(self, poll_interval: float = 3.0):
         """Blocks execution and polls until power-cycled hardware becomes reachable again."""
@@ -163,7 +183,8 @@ class ExperimentController:
             "ml_confidence": None,
             "ml_prob_fresh": None,
             "ml_prob_light_aged": None,
-            "ml_prob_heavy_aged": None
+            "ml_prob_heavy_aged": None,
+            "blockchain_tx": None
         })
 
         retry_count = 1
@@ -190,7 +211,8 @@ class ExperimentController:
                     "ml_confidence": None,
                     "ml_prob_fresh": None,
                     "ml_prob_light_aged": None,
-                    "ml_prob_heavy_aged": None
+                    "ml_prob_heavy_aged": None,
+                    "blockchain_tx": None
                 })
                 break
             retry_count += 1
@@ -268,6 +290,22 @@ class ExperimentController:
                     )
 
                 # 8. Append Synchronized Telemetry Row
+                blockchain_tx = None
+                if self.ledger:
+                    blockchain_tx = self.ledger.record_measurement(
+                        s2p_path=s2p_path,
+                        sha256_hex=file_hash,
+                        metadata={
+                            "experiment": self.cfg.experiment_name,
+                            "iso_time": t_dt.isoformat(),
+                            "file_type": "s2p",
+                            "ml_class": ml_res['class'],
+                            "ml_label": ml_res['label'],
+                            "rtd_setpoint_c": heater_stats.get("setpoint"),
+                            "rtd_measured_temp_c": heater_stats.get("temp"),
+                        },
+                    )
+
                 self.telemetry.log_sweep({
                     "iso_time": t_dt.isoformat(),
                     "epoch_time": t_epoch,
@@ -288,7 +326,8 @@ class ExperimentController:
                     "ml_confidence": ml_res['confidence'],
                     "ml_prob_fresh": ml_res['probabilities'][0],
                     "ml_prob_light_aged": ml_res['probabilities'][1],
-                    "ml_prob_heavy_aged": ml_res['probabilities'][2]
+                    "ml_prob_heavy_aged": ml_res['probabilities'][2],
+                    "blockchain_tx": blockchain_tx
                 })
 
                 # 9. Update Live Plotter GUI

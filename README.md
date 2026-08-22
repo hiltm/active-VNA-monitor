@@ -18,6 +18,7 @@ The whole experiment runs as a single long-lived acquisition loop with automatic
 - [Detailed Operation of the Acquisition Loop](#detailed-operation-of-the-acquisition-loop)
 - [Thermal Stepped-PID Control](#thermal-stepped-pid-control)
 - [Machine-Learning Aging Classifier](#machine-learning-aging-classifier)
+- [Blockchain Provenance Ledger](#blockchain-provenance-ledger)
 - [Output Files](#output-files)
 - [Fault Tolerance and Recovery](#fault-tolerance-and-recovery)
 - [Stopping the Experiment](#stopping-the-experiment)
@@ -72,12 +73,21 @@ All serial devices are addressed by stable `/dev/serial/by-id/...` paths in the 
   - `simple-pid` — RTD thermal control loop
   - `matplotlib` — live plotting
   - `pyserial` — PSU and ambient sensor serial I/O
+  - `web3` — *optional*; only needed when `enable_blockchain_sync = True` (blockchain provenance ledger)
 
 Install (example):
 
 ```bash
 pip install pynanovna scikit-rf numpy scikit-learn joblib simple-pid matplotlib pyserial
 ```
+
+The blockchain ledger is optional. Install `web3` only if you enable it:
+
+```bash
+pip install web3
+```
+
+> The suite imports `web3` lazily, so it runs normally without the package installed as long as `enable_blockchain_sync = False`.
 
 ---
 
@@ -100,13 +110,18 @@ active-VNA-monitor/
 ├── plugins/
 │   ├── ml_engine.py            # RFAgingClassifier — feature extraction + inference
 │   ├── anomaly_detector.py     # (placeholder, empty)
-│   └── blockchain_ledger.py    # (placeholder, empty)
+│   └── blockchain_ledger.py    # BlockchainLedger — web3.py provenance ledger client
 ├── ui/
 │   └── visualizer.py           # LivePlotter — live S11/S21 magnitude plot
-└── models/
-    ├── rf_model.joblib         # Trained RandomForest classifier
-    ├── scaler.joblib           # StandardScaler fitted at training time
-    └── training_metadata.joblib
+├── models/
+│   ├── rf_model.joblib         # Trained RandomForest classifier
+│   ├── scaler.joblib           # StandardScaler fitted at training time
+│   └── training_metadata.joblib
+└── blockchain/                 # Minimal Hardhat project: DataRegistry contract + deploy
+    ├── contracts/DataRegistry.sol
+    ├── scripts/deploy.js        # writes artifacts_on_chain/contract-address.json
+    ├── hardhat.config.js
+    └── package.json             # compile / node / deploy scripts
 ```
 
 ---
@@ -125,7 +140,7 @@ All runtime behavior is controlled by the `AppConfig` dataclass in `config.py`. 
 | `enable_live_plot` | `True` | Show the live matplotlib S11/S21 plot. |
 | `enable_ml_evaluation` | `True` | Load the classifier and run inference each sweep. |
 | `enable_anomaly_detection` | `False` | Reserved (placeholder plugin). |
-| `enable_blockchain_sync` | `False` | Reserved (placeholder plugin). |
+| `enable_blockchain_sync` | `False` | Commit each sweep's SHA-256 + metadata to the local blockchain provenance ledger (see [Blockchain Provenance Ledger](#blockchain-provenance-ledger)). Requires `web3`. |
 
 ### Key parameters
 
@@ -145,6 +160,10 @@ All runtime behavior is controlled by the `AppConfig` dataclass in `config.py`. 
 | `rtd_tolerance` | `1.0` | °C band considered "on setpoint". |
 | `rtd_stable_samples` | `3` | Consecutive in-band samples before dwell starts. |
 | `rtd_kp` / `rtd_ki` / `rtd_kd` | `0.0020` / `0.0010` / `0.0` | PID gains (output = heater current in A). |
+| `blockchain_rpc_url` | `http://127.0.0.1:8545` | JSON-RPC endpoint of the local chain (used when `enable_blockchain_sync`). |
+| `blockchain_contract_address_file` | `.../artifacts_on_chain/contract-address.json` | Path to the Hardhat deploy artifact holding the deployed `DataRegistry` address. |
+| `blockchain_chain_id` | `None` | Chain id; `None` auto-detects from the node. |
+| `blockchain_private_key` | `None` | Signing key; `None` uses a node-unlocked account (Hardhat default). |
 
 > **Note:** `base_save_dir` and `ml_model_dir` default to absolute paths under `/home/chiptamper/...`. Update these for your machine before running.
 
@@ -257,9 +276,10 @@ Each iteration of the main loop (`ExperimentController.run`) performs the follow
 6. **Record packing** — all channels are bundled into a `MeasurementRecord` (temperature prefers the heater reading, falling back to ambient).
 7. **Touchstone save** — `DataStorage.save_record()` builds a `scikit-rf` 2×2 S-parameter network and writes `measurement_<timestamp>.s2p`. A SHA-256 checksum of the file is computed for integrity.
 8. **ML inference** — if enabled, `RFAgingClassifier.evaluate()` extracts a feature vector, scales it, predicts the aging class, and reports class id, label, confidence, and per-class probabilities.
-9. **Telemetry row** — a fully synchronized row (RF file + checksum + thermal + DUT + ML columns) is appended to the telemetry CSV.
-10. **Live plot** — `LivePlotter.update()` redraws S11 and S21 magnitude (dB) vs frequency with the current timestamp/temperature in the title.
-11. **Sleep** — waits `loop_interval_seconds` before the next cycle.
+9. **Blockchain commit** — if `enable_blockchain_sync` is set, `BlockchainLedger.record_measurement()` writes the sweep's SHA-256 + metadata to the on-chain `DataRegistry` contract and returns a transaction hash. This step is fail-soft: a chain error is logged and the loop continues (the tx column is left blank).
+10. **Telemetry row** — a fully synchronized row (RF file + checksum + thermal + DUT + ML columns + blockchain tx) is appended to the telemetry CSV.
+11. **Live plot** — `LivePlotter.update()` redraws S11 and S21 magnitude (dB) vs frequency with the current timestamp/temperature in the title.
+12. **Sleep** — waits `loop_interval_seconds` before the next cycle.
 
 If steps 2–5 raise (any hardware I/O error), the loop calls `wait_for_hardware_recovery()` and skips the rest of that iteration.
 
@@ -302,6 +322,88 @@ Because feature length depends on `points`, the sweep `points` in `config.py` mu
 
 ---
 
+## Blockchain Provenance Ledger
+
+`plugins/blockchain_ledger.py` implements `BlockchainLedger`, an optional tamper-evidence layer. When `enable_blockchain_sync = True`, every acquired sweep is committed to a smart contract on a local Ethereum-compatible chain.
+
+### What it provides
+
+- **Proof of integrity.** Only the file's **SHA-256 hash** (plus lightweight metadata) is written on-chain — never the measurement data itself. Later you can re-hash the `.s2p` file on disk and compare it against the immutable on-chain record; any post-acquisition edit changes the hash and is detectable.
+- **Immutable, ordered timeline.** Each record carries a chain `block.timestamp` and an ever-increasing record id, giving an append-only audit trail. This complements the (editable) SHA-256 column already in the telemetry CSV with a record that cannot be silently altered.
+- **Attribution.** Every record notes the submitting wallet address.
+
+> **Scope / limitation:** the ledger proves a file is *unchanged since it was committed*; it does **not** prove the sweep itself is physically genuine. On a **local** Hardhat chain the immutability guarantee is only as strong as that node — stronger tamper-resistance requires a shared or persistent chain.
+
+### What is stored on-chain
+
+Each record (via the `DataRegistry.addRecord(...)` contract call) contains:
+
+| Field | Source |
+|-------|--------|
+| `fileHash` (`bytes32`) | SHA-256 of the `.s2p` file (reuses the hash the loop already computes) |
+| `fileName` | Touchstone filename |
+| `storageURI` | `file://` absolute path to the on-disk file |
+| `fileSizeBytes` | File size |
+| `metadataJSON` | JSON: experiment name, ISO time, file type, ML class/label, RTD setpoint/temp |
+| `createdAt` | Block timestamp (set by the chain) |
+| `submittedBy` | Submitting wallet address (set by the chain) |
+
+The resulting transaction hash is also written to the `blockchain_tx` column of the telemetry CSV, linking each on-disk row to its on-chain record.
+
+### Contract and starter project
+
+The Solidity contract and a minimal Hardhat project (compile + deploy only) live under `blockchain/`. The Python plugin talks to the `DataRegistry` contract via `web3.py` and commits records **live inside the acquisition loop** — there is no separate Node ingestion step.
+
+### Usage
+
+1. **Install web3** in the suite's Python environment:
+
+   ```bash
+   pip install web3
+   ```
+
+2. **Set up and run the local chain** (from the starter project — needs Node.js + `npm install`):
+
+   ```bash
+   cd blockchain
+   npm install
+   npm run compile
+   npm run node        # Terminal 1: local chain on http://127.0.0.1:8545 (keep open)
+   ```
+
+3. **Deploy the contract** (Terminal 2). This writes `artifacts_on_chain/contract-address.json`:
+
+   ```bash
+   npm run deploy
+   ```
+
+4. **Configure the suite** in `config.py`:
+   - `enable_blockchain_sync = True`
+   - `blockchain_rpc_url` → the chain's JSON-RPC URL (default `http://127.0.0.1:8545`)
+   - `blockchain_contract_address_file` → the `contract-address.json` written by the deploy step
+   - `blockchain_chain_id` → leave `None` to auto-detect
+   - `blockchain_private_key` → leave `None` to use a node-unlocked account (Hardhat default), or set a key to sign transactions explicitly
+
+5. **Run the suite** normally (`python main.py`). On startup it connects to the ledger (logging the contract address and existing record count); each cycle then commits one record and records the tx hash in the telemetry CSV.
+
+### Behavior and fault tolerance
+
+- **Startup:** if `enable_blockchain_sync` is on but the node/contract is unreachable, connection fails during `connect_all_hardware`, so the suite retries connection at boot (same as any other subsystem) rather than starting blind.
+- **Per-sweep:** `record_measurement()` is **fail-soft** — if a single commit fails (chain hiccup, timeout), the error is logged, `blockchain_tx` is left blank for that row, and acquisition continues uninterrupted.
+- **Dependency isolation:** `web3` is imported lazily, so the suite runs normally without the package installed as long as the feature is disabled.
+
+### Verifying a record
+
+Re-hash a file on disk and compare it to the value stored on-chain:
+
+```bash
+sha256sum /path/to/measurement_<timestamp>.s2p
+```
+
+Match the printed hash against the `touchstone_sha256` in the telemetry CSV and the `fileHash` in the on-chain record for that `blockchain_tx`.
+
+---
+
 ## Output Files
 
 All outputs are written under `base_save_dir/experiment_name/`:
@@ -309,7 +411,7 @@ All outputs are written under `base_save_dir/experiment_name/`:
 | File | Written by | Contents |
 |------|-----------|----------|
 | `measurement_<timestamp>.s2p` | `DataStorage` | Touchstone 2-port sweep (one per cycle). |
-| `<experiment>_telemetry.csv` | `ExperimentTelemetryLogger` | One synchronized row per cycle (RF filename + checksum, ambient/RTD/DUT telemetry, ML class/label/confidence/probabilities). |
+| `<experiment>_telemetry.csv` | `ExperimentTelemetryLogger` | One synchronized row per cycle (RF filename + checksum, ambient/RTD/DUT telemetry, ML class/label/confidence/probabilities, blockchain tx hash). |
 | `<experiment>_events.log` | `setup_system_logger` | Timestamped event/error log. |
 | `run_manifest.json` | `ExperimentTelemetryLogger` | Run metadata: creation time, git commit hash, full config snapshot. |
 
@@ -321,7 +423,8 @@ ambient_temp_c, rtd_setpoint_c, rtd_measured_temp_c, rtd_resistance_ohm,
 rtd_current_a, rtd_voltage_v, rtd_phase, dut_voltage_v,
 dut_current_ma, dut_power_mw,
 ml_class, ml_label, ml_confidence,
-ml_prob_fresh, ml_prob_light_aged, ml_prob_heavy_aged
+ml_prob_fresh, ml_prob_light_aged, ml_prob_heavy_aged,
+blockchain_tx
 ```
 
 ---
