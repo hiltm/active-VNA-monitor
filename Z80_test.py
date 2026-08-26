@@ -6,6 +6,11 @@ import dataclasses
 from pathlib import Path
 from datetime import datetime
 
+# Add project root directory to Python module search path
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from config import AppConfig
 from core.models import MeasurementRecord
 from core.storage import DataStorage
@@ -17,6 +22,7 @@ from drivers.dut_power import DUTPowerController
 from drivers.temp_sensor import TemperatureSensor
 from plugins.ml_engine import RFAgingClassifier
 from targets.z80.z80_driver import Z80Controller
+
 
 
 class Z80ExperimentRunner:
