@@ -96,23 +96,32 @@ class Z80ExperimentRunner:
         self.logger.info(f"Initializing 4-Stage Test for DUT: {self.serial_number}")
         self.logger.info(f"Destination: {self.experiment_dir}")
 
-        # 1. NanoVNA
+        # 1. NanoVNA (required — this is the core acquisition device)
         self.logger.info(f"Connecting to NanoVNA (Port: {self.cfg.vna_port})...")
         self.vna = VNADevice(self.cfg.start_freq, self.cfg.stop_freq, self.cfg.points, self.cfg.vna_port)
         self.vna.connect()
 
-        # 2. Power Supply
-        self.logger.info(f"Connecting to PSU on {self.cfg.power_supply_port}...")
-        self.psu = GPD2303S(self.cfg.power_supply_port)
-        self.psu.connect()
-        self.dut = DUTPowerController(self.psu, channel=self.cfg.dut_channel)
-        self.dut.power_off()
+        # 2. Power Supply (optional — skip if not connected)
+        try:
+            self.logger.info(f"Connecting to PSU on {self.cfg.power_supply_port}...")
+            self.psu = GPD2303S(self.cfg.power_supply_port)
+            self.psu.connect()
+            self.dut = DUTPowerController(self.psu, channel=self.cfg.dut_channel)
+            self.dut.power_off()
+        except Exception as e:
+            self.logger.warning(f"PSU not connected ({e}). Continuing without power-supply control.")
+            self.psu = None
+            self.dut = None
 
-        # 3. Ambient Sensor
+        # 3. Ambient Sensor (optional)
         if self.cfg.enable_ambient_temp:
-            self.logger.info(f"Connecting to ambient sensor on {self.cfg.ambient_temp_port}...")
-            self.temp_sensor = TemperatureSensor(self.cfg.ambient_temp_port)
-            self.temp_sensor.connect()
+            try:
+                self.logger.info(f"Connecting to ambient sensor on {self.cfg.ambient_temp_port}...")
+                self.temp_sensor = TemperatureSensor(self.cfg.ambient_temp_port)
+                self.temp_sensor.connect()
+            except Exception as e:
+                self.logger.warning(f"Ambient sensor not connected ({e}). Continuing without ambient temperature.")
+                self.temp_sensor = None
 
         # 4. ML Aging Classifier
         if self.cfg.enable_ml_evaluation:
@@ -125,14 +134,18 @@ class Z80ExperimentRunner:
             self.logger.info("Starting live visualizer GUI...")
             self.plotter = LivePlotter(self.cfg.start_freq, self.cfg.stop_freq)
 
-        # 6. Z80 Target Driver
-        self.z80 = Z80Controller(
-            port=self.cfg.z80_serial_port,
-            baud_rate=self.cfg.z80_baud_rate,
-            binary_path=self.cfg.z80_binary_path,
-            binary_addr=self.cfg.z80_binary_addr,
-            kickoff_byte=self.cfg.z80_kickoff_byte
-        )
+        # 6. Z80 Target Driver (optional — construction only; connection verified at Stage 3)
+        try:
+            self.z80 = Z80Controller(
+                port=self.cfg.z80_serial_port,
+                baud_rate=self.cfg.z80_baud_rate,
+                binary_path=self.cfg.z80_binary_path,
+                binary_addr=self.cfg.z80_binary_addr,
+                kickoff_byte=self.cfg.z80_kickoff_byte
+            )
+        except Exception as e:
+            self.logger.warning(f"Z80 driver not initialized ({e}). Continuing without Z80 control.")
+            self.z80 = None
 
     def capture_single_sweep(self, stage_name: str) -> dict:
         t_dt = datetime.now()
@@ -219,7 +232,8 @@ class Z80ExperimentRunner:
             # ----------------------------------------------------
             # STAGE 1: UNPOWERED
             # ----------------------------------------------------
-            self.dut.power_off()
+            if self.dut:
+                self.dut.power_off()
             self.run_stage_for_duration("1_UNPOWERED", self.step_duration_s)
 
             # ----------------------------------------------------
@@ -229,20 +243,46 @@ class Z80ExperimentRunner:
 
             # ----------------------------------------------------
             # STAGE 2: POWERED (IDLE)
+            # NOTE: DUT power is applied MANUALLY for this board — the suite
+            # does NOT drive the PSU output on. Ensure the DUT is powered
+            # before the capture window begins.
             # ----------------------------------------------------
-            self.dut.power_on(voltage=self.cfg.dut_voltage, current_limit=self.cfg.dut_current_limit)
-            time.sleep(1.0)
             self.run_stage_for_duration("2_POWERED_IDLE", self.step_duration_s)
 
             # ----------------------------------------------------
             # AUTO ADVANCE 2 -> 3: PROGRAM Z80 & START TRAFFIC
             # ----------------------------------------------------
-            self.logger.info(f"[{self.serial_number}] Auto-transitioning to Step 3: Programming Z80 & Starting Software...")
-            if self.z80.program_and_run():
-                stage3_log = self.experiment_dir / "3_POWERED_Z80_ACTIVE" / f"{self.serial_number}_Z80_Responses.txt"
-                self.z80.start_monitoring(stage3_log)
+            # STAGE 3 START NOTIFICATION
+            self.logger.info("=" * 60)
+            self.logger.info(f">>> STARTING STEP 3: POWERED + Z80 ACTIVE  (DUT {self.serial_number}) <<<")
+            self.logger.info("=" * 60)
+            print(
+                f"\n\033[96;1m========================================================\033[0m\n"
+                f"\033[92;1m>>> STEP 3 STARTING: POWERED + Z80 ACTIVE (DUT {self.serial_number}) <<<\033[0m\n"
+                f"\033[96;1m========================================================\033[0m\n"
+            )
+
+            # Confirm Z80 serial comms before capturing Stage 3 data.
+            # The operator presses the RESET button on the Z80 board and
+            # confirms that the serial traffic after reset is valid — a working
+            # DUT emits the expected 01 01 01 stream (see
+            # Z80Controller.check_serial_comms / VALID_COMMS_SIGNAL in
+            # Z80_driver.py). Then they press ENTER to proceed.
+            if self.z80:
+                wait_for_user_with_flash(
+                    f"[{self.serial_number}] Press the Z80 RESET button and confirm valid serial "
+                    f"traffic (expected 01 01 01). Press ENTER only once traffic looks good"
+                )
+                self.logger.info("Operator confirmed Z80 serial comms. Proceeding with Step 3 data capture.")
+
+                self.logger.info(f"[{self.serial_number}] Programming Z80 & Starting Software...")
+                if self.z80.program_and_run():
+                    stage3_log = self.experiment_dir / "3_POWERED_Z80_ACTIVE" / f"{self.serial_number}_Z80_Responses.txt"
+                    self.z80.start_monitoring(stage3_log)
+                else:
+                    self.logger.error("Z80 BLOAD programming failed! Continuing acquisition loop without active serial traffic...")
             else:
-                self.logger.error("Z80 BLOAD programming failed! Continuing acquisition loop without active serial traffic...")
+                self.logger.warning("No Z80 driver available; running Step 3 without Z80 traffic.")
 
             # ----------------------------------------------------
             # STAGE 3: POWERED + Z80 ACTIVE
@@ -257,9 +297,10 @@ class Z80ExperimentRunner:
             # ----------------------------------------------------
             # STAGE 4: POWERED + Z80 ACTIVE + COOLING
             # ----------------------------------------------------
-            self.z80.stop_monitoring()
-            stage4_log = self.experiment_dir / "4_POWERED_Z80_ACTIVE_COOLING" / f"{self.serial_number}_Z80_Responses.txt"
-            self.z80.start_monitoring(stage4_log)
+            if self.z80:
+                self.z80.stop_monitoring()
+                stage4_log = self.experiment_dir / "4_POWERED_Z80_ACTIVE_COOLING" / f"{self.serial_number}_Z80_Responses.txt"
+                self.z80.start_monitoring(stage4_log)
 
             self.run_stage_for_duration("4_POWERED_Z80_ACTIVE_COOLING", self.step_duration_s)
 

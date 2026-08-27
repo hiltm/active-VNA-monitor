@@ -51,7 +51,7 @@ class AppConfig:
     z80_baud_rate: int = 9600
     z80_binary_path: str = (
         "/home/chiptamper/chiptamper/git/active-VNA-monitor/"
-        "targets/z80/Test1Sec_ND.bin"
+        "targets/Z80/Test1Sec_ND.bin"
     )
     z80_binary_addr: str = "0800"
     z80_kickoff_byte: int = 5

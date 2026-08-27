@@ -51,6 +51,59 @@ class Z80Controller:
             logger.info("Closed Z80 serial connection.")
         self._ser = None
 
+    # Signal that indicates the Z80/DUT is working correctly.
+    # After the board is reset it emits a stream of 0x01 bytes
+    # (e.g. 01 01 01) on the serial link. Seeing this pattern means the
+    # DUT is alive and communicating as expected.
+    VALID_COMMS_SIGNAL = bytes([0x01, 0x01, 0x01])
+
+    def check_serial_comms(self, listen_s: float | None = None) -> bool:
+        """Passively verify the Z80/DUT serial link is producing valid traffic.
+
+        The working DUT emits a stream of 0x01 bytes (e.g. 01 01 01) after a
+        reset. This method just listens on the port (it does NOT send any
+        command) and reports whether that expected 0x01 traffic is seen.
+
+        Returns True when valid 0x01 traffic is observed, False otherwise.
+        Intended as an optional aid; the operator visually confirms traffic
+        after pressing the Z80 reset button.
+        """
+        try:
+            self.connect()
+        except Exception as e:
+            logger.error(f"Z80 comms check: could not open serial port {self.port}: {e}")
+            return False
+
+        window = listen_s if listen_s is not None else self.step_timeout_s
+        accumulated = b''
+        deadline = time.time() + window
+        while time.time() < deadline:
+            try:
+                if self._ser and self._ser.in_waiting > 0:
+                    accumulated += self._ser.read_all()
+            except Exception as e:
+                logger.error(f"Z80 comms check: read error: {e}")
+                return False
+            time.sleep(0.05)
+
+        if not accumulated:
+            logger.warning("Z80 comms check: no serial traffic seen (link may be idle or dead).")
+            return False
+
+        # Expected valid traffic: 0x01 bytes (the 01 01 01 pattern).
+        if any(b == 0x01 for b in accumulated):
+            logger.info(
+                f"Z80 comms check: valid 0x01 traffic observed "
+                f"({' '.join(f'{b:02x}' for b in accumulated[:8])}...). DUT is communicating."
+            )
+            return True
+
+        logger.warning(
+            f"Z80 comms check: traffic seen but no expected 0x01 bytes "
+            f"({' '.join(f'{b:02x}' for b in accumulated[:8])}...)."
+        )
+        return False
+
     def _write_command(self, cmd_text: str):
         """Writes a line command terminated with CR."""
         if self._ser:
