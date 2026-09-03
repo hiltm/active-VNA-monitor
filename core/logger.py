@@ -8,7 +8,18 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict
 
+
+class CalibrationFilter(logging.Filter):
+    """Suppresses repetitive pynanovna calibration warnings logged to root or module handlers."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage().lower()
+        if "calibration" in msg or "calibrate" in msg:
+            return False
+        return True
+
+
 class ResilientFileHandler(logging.FileHandler):
+    """FileHandler that automatically falls back to an alternate filename if write permissions fail."""
     def __init__(self, filename: Path, encoding: str = "utf-8"):
         self.base_path = Path(filename)
         self.current_path = self.base_path
@@ -39,6 +50,7 @@ class ResilientFileHandler(logging.FileHandler):
 
 
 def setup_system_logger(log_dir: Path, experiment_name: str) -> logging.Logger:
+    """Configures the primary suite logger, terminal outputs, and suppresses VNA calibration spam."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"{experiment_name}_events.log"
 
@@ -49,6 +61,7 @@ def setup_system_logger(log_dir: Path, experiment_name: str) -> logging.Logger:
     if logger.hasHandlers():
         logger.handlers.clear()
 
+    # File Handler
     fh = ResilientFileHandler(log_file)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
@@ -56,28 +69,49 @@ def setup_system_logger(log_dir: Path, experiment_name: str) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S"
     ))
 
+    # Console Handler
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
 
+    # Apply calibration filter across all suite handlers
+    cal_filter = CalibrationFilter()
+    fh.addFilter(cal_filter)
+    ch.addFilter(cal_filter)
+
     logger.addHandler(fh)
     logger.addHandler(ch)
 
-    logging.getLogger("pynanovna").setLevel(logging.ERROR)
-    logging.getLogger("pynanovna.hardware.Hardware").setLevel(logging.ERROR)
+    # Attach filter to root logger and root handlers to catch pynanovna's logging.critical() calls
+    root_logger = logging.getLogger()
+    root_logger.addFilter(cal_filter)
+    for handler in root_logger.handlers:
+        handler.addFilter(cal_filter)
+
+    # Silence internal pynanovna loggers above critical level
+    for lib_name in [
+        "pynanovna",
+        "pynanovna.hardware",
+        "pynanovna.hardware.Hardware",
+        "pynanovna.hardware.NanoVNA",
+        "pynanovna.hardware.VNABase"
+    ]:
+        pylog = logging.getLogger(lib_name)
+        pylog.setLevel(logging.CRITICAL + 1)
+        pylog.addFilter(cal_filter)
 
     return logger
 
 
 class ExperimentTelemetryLogger:
+    """Writes synchronized sweep metadata, power levels, and ML inference predictions to CSV."""
     CSV_HEADERS = [
         "iso_time", "epoch_time", "touchstone_file", "touchstone_sha256",
         "ambient_temp_c", "rtd_setpoint_c", "rtd_measured_temp_c", "rtd_resistance_ohm",
         "rtd_current_a", "rtd_voltage_v", "rtd_phase", "dut_voltage_v", 
         "dut_current_ma", "dut_power_mw",
         "ml_class", "ml_label", "ml_confidence",
-        "ml_prob_fresh", "ml_prob_light_aged", "ml_prob_heavy_aged",
-        "blockchain_tx"
+        "ml_prob_fresh", "ml_prob_light_aged", "ml_prob_heavy_aged"
     ]
 
     def __init__(self, output_dir: Path, experiment_name: str, config_snapshot: dict):
