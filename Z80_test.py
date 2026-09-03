@@ -7,12 +7,12 @@ import importlib.util
 from pathlib import Path
 from datetime import datetime
 
-# 1. Add project root directory to Python module search path
+# 1. Add project root directory to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# 2. Project subsystem imports
+# 2. Subsystem imports
 from config import AppConfig
 from core.models import MeasurementRecord
 from core.storage import DataStorage
@@ -25,7 +25,7 @@ from drivers.temp_sensor import TemperatureSensor
 from ui.visualizer import LivePlotter
 from plugins.ml_engine import RFAgingClassifier
 
-# 3. Robust Z80 controller import with case-insensitivity & path fallback
+# 3. Dynamic Z80 driver loader with path fallback
 try:
     from targets.z80.z80_driver import Z80Controller
 except (ModuleNotFoundError, ImportError):
@@ -64,13 +64,15 @@ class Z80ExperimentRunner:
         self.serial_number = serial_number
         self.step_duration_s = step_duration_s
 
-        # Unique folder naming: <serial_number>_<YYYYMMDD_HHMMSS>
+        # Folder convention: <serial_number>_<YYYYMMDD_HHMMSS>
         self.timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.experiment_name = f"{self.serial_number}_{self.timestamp_str}"
         self.experiment_dir = Path(cfg.base_save_dir) / self.experiment_name
         self.experiment_dir.mkdir(parents=True, exist_ok=True)
 
+        # Log files in the root experiment folder
         self.logger = setup_system_logger(self.experiment_dir, self.experiment_name)
+        self.z80_traffic_file = self.experiment_dir / f"{self.experiment_name}_z80_traffic.txt"
         
         cfg_snapshot = dataclasses.asdict(cfg)
         cfg_snapshot["serial_number"] = self.serial_number
@@ -83,7 +85,7 @@ class Z80ExperimentRunner:
         )
         self.storage = DataStorage(cfg.base_save_dir, self.experiment_name)
 
-        # Hardware, Plugin & GUI Handles
+        # Subsystems
         self.vna = None
         self.psu = None
         self.dut = None
@@ -93,48 +95,60 @@ class Z80ExperimentRunner:
         self.z80 = None
 
     def initialize_hardware(self):
-        self.logger.info(f"Initializing 4-Stage Test for DUT: {self.serial_number}")
-        self.logger.info(f"Destination: {self.experiment_dir}")
+        """Initializes hardware non-blockingly, allowing optional devices to be skipped."""
+        self.logger.info(f"Initializing Test Suite for DUT: {self.serial_number}")
+        self.logger.info(f"Output Directory: {self.experiment_dir}")
 
-        # 1. NanoVNA (required — this is the core acquisition device)
-        self.logger.info(f"Connecting to NanoVNA (Port: {self.cfg.vna_port})...")
+        # 1. NanoVNA (Required)
+        self.logger.info(f"Connecting to NanoVNA on {self.cfg.vna_port}...")
         self.vna = VNADevice(self.cfg.start_freq, self.cfg.stop_freq, self.cfg.points, self.cfg.vna_port)
         self.vna.connect()
 
-        # 2. Power Supply (optional — skip if not connected)
-        try:
-            self.logger.info(f"Connecting to PSU on {self.cfg.power_supply_port}...")
-            self.psu = GPD2303S(self.cfg.power_supply_port)
-            self.psu.connect()
-            self.dut = DUTPowerController(self.psu, channel=self.cfg.dut_channel)
-            self.dut.power_off()
-        except Exception as e:
-            self.logger.warning(f"PSU not connected ({e}). Continuing without power-supply control.")
-            self.psu = None
-            self.dut = None
+        # 2. Power Supply (Optional)
+        if self.cfg.enable_power_supply:
+            try:
+                self.logger.info(f"Connecting to PSU on {self.cfg.power_supply_port}...")
+                self.psu = GPD2303S(self.cfg.power_supply_port)
+                self.psu.connect()
+                self.dut = DUTPowerController(self.psu, channel=self.cfg.dut_channel)
+                self.dut.power_off()
+            except Exception as e:
+                self.logger.warning(f"Power Supply not available ({e}). Proceeding in manual power mode.")
+                self.psu = None
+                self.dut = None
+        else:
+            self.logger.info("Automated power supply disabled in config.")
 
-        # 3. Ambient Sensor (optional)
+        # 3. Ambient Sensor (Optional)
         if self.cfg.enable_ambient_temp:
             try:
                 self.logger.info(f"Connecting to ambient sensor on {self.cfg.ambient_temp_port}...")
                 self.temp_sensor = TemperatureSensor(self.cfg.ambient_temp_port)
                 self.temp_sensor.connect()
             except Exception as e:
-                self.logger.warning(f"Ambient sensor not connected ({e}). Continuing without ambient temperature.")
+                self.logger.warning(f"Ambient temperature sensor not detected ({e}). Skipping sensor.")
                 self.temp_sensor = None
 
         # 4. ML Aging Classifier
         if self.cfg.enable_ml_evaluation:
-            self.logger.info(f"Loading {self.cfg.ml_model_type.upper()} classifier from {self.cfg.ml_model_dir}...")
-            self.ml_classifier = RFAgingClassifier(self.cfg.ml_model_dir, self.cfg.ml_model_type)
-            self.ml_classifier.load_model()
+            try:
+                self.logger.info(f"Loading {self.cfg.ml_model_type.upper()} model from {self.cfg.ml_model_dir}...")
+                self.ml_classifier = RFAgingClassifier(self.cfg.ml_model_dir, self.cfg.ml_model_type)
+                self.ml_classifier.load_model()
+            except Exception as e:
+                self.logger.warning(f"ML Classifier could not be loaded ({e}). Evaluation disabled.")
+                self.ml_classifier = None
 
         # 5. Live Plotter GUI
         if self.cfg.enable_live_plot and not self.plotter:
-            self.logger.info("Starting live visualizer GUI...")
-            self.plotter = LivePlotter(self.cfg.start_freq, self.cfg.stop_freq)
+            try:
+                self.logger.info("Initializing Live Plotter GUI...")
+                self.plotter = LivePlotter(self.cfg.start_freq, self.cfg.stop_freq)
+            except Exception as e:
+                self.logger.warning(f"Could not initialize GUI plotter ({e}). Continuing in headless mode.")
+                self.plotter = None
 
-        # 6. Z80 Target Driver (optional — construction only; connection verified at Stage 3)
+        # 6. Z80 Target Controller (Optional)
         try:
             self.z80 = Z80Controller(
                 port=self.cfg.z80_serial_port,
@@ -143,8 +157,9 @@ class Z80ExperimentRunner:
                 binary_addr=self.cfg.z80_binary_addr,
                 kickoff_byte=self.cfg.z80_kickoff_byte
             )
+            self.z80.connect()
         except Exception as e:
-            self.logger.warning(f"Z80 driver not initialized ({e}). Continuing without Z80 control.")
+            self.logger.warning(f"Z80 serial port not open ({e}). Serial automation will be disabled.")
             self.z80 = None
 
     def capture_single_sweep(self, stage_name: str) -> dict:
@@ -154,7 +169,7 @@ class Z80ExperimentRunner:
         ambient_val = self.temp_sensor.read_temperature() if self.temp_sensor else None
         dut_stats = self.dut.read_telemetry() if self.dut else {}
 
-        # Capture S-parameters
+        # Capture RF
         freqs, s11, s21, s12, s22 = self.vna.sweep()
 
         record = MeasurementRecord(
@@ -168,11 +183,11 @@ class Z80ExperimentRunner:
             power_state=dut_stats
         )
 
-        # Save into stage subfolder (e.g. 1_UNPOWERED/measurement_...)
+        # Write to stage subfolder
         s2p_path = self.storage.save_record(record, subfolder=stage_name)
         file_hash = ExperimentTelemetryLogger.compute_sha256(s2p_path)
 
-        # Real-time ML Aging Classification
+        # ML Inference
         ml_res = {
             'class': None,
             'label': 'Disabled',
@@ -182,7 +197,6 @@ class Z80ExperimentRunner:
         if self.ml_classifier:
             ml_res = self.ml_classifier.evaluate(record)
 
-        # Log relative path inside telemetry CSV
         relative_s2p_name = f"{stage_name}/{s2p_path.name}"
         self.telemetry.log_sweep({
             "iso_time": t_dt.isoformat(),
@@ -207,7 +221,6 @@ class Z80ExperimentRunner:
             "ml_prob_heavy_aged": ml_res['probabilities'][2]
         })
 
-        # Update Live Plotter GUI
         if self.plotter:
             self.plotter.update(record)
 
@@ -237,52 +250,55 @@ class Z80ExperimentRunner:
             self.run_stage_for_duration("1_UNPOWERED", self.step_duration_s)
 
             # ----------------------------------------------------
-            # PROMPT 1 -> 2
+            # PROMPT 1 -> 2: MANUAL POWER CONNECTION
             # ----------------------------------------------------
-            wait_for_user_with_flash(f"[{self.serial_number}] Step 1 Complete -> Prepare for Step 2 (POWERED)")
+            wait_for_user_with_flash(f"[{self.serial_number}] Step 1 Complete -> MANUALLY CONNECT POWER FOR STEP 2")
 
             # ----------------------------------------------------
-            # STAGE 2: POWERED (IDLE)
-            # NOTE: DUT power is applied MANUALLY for this board — the suite
-            # does NOT drive the PSU output on. Ensure the DUT is powered
-            # before the capture window begins.
+            # STAGE 2: POWERED (IDLE) - MANUAL
             # ----------------------------------------------------
+            self.logger.info(f"[{self.serial_number}] Commencing Step 2: Powered Idle (Manual Power Active)...")
             self.run_stage_for_duration("2_POWERED_IDLE", self.step_duration_s)
 
             # ----------------------------------------------------
-            # AUTO ADVANCE 2 -> 3: PROGRAM Z80 & START TRAFFIC
+            # AUTO ADVANCE 2 -> 3: TERMINAL BANNER & SYNC CHECK
             # ----------------------------------------------------
-            # STAGE 3 START NOTIFICATION
-            self.logger.info("=" * 60)
-            self.logger.info(f">>> STARTING STEP 3: POWERED + Z80 ACTIVE  (DUT {self.serial_number}) <<<")
-            self.logger.info("=" * 60)
-            print(
-                f"\n\033[96;1m========================================================\033[0m\n"
-                f"\033[92;1m>>> STEP 3 STARTING: POWERED + Z80 ACTIVE (DUT {self.serial_number}) <<<\033[0m\n"
-                f"\033[96;1m========================================================\033[0m\n"
-            )
+            print("\n" + "=" * 70)
+            print(">>> NOTIFICATION: STEP 3 (POWERED + Z80 ACTIVE) STARTING <<<")
+            print("=" * 70 + "\n")
+            self.logger.info(">>> STEP 3 START: Programming Z80 & Validating Serial Traffic <<<")
 
-            # Confirm Z80 serial comms before capturing Stage 3 data.
-            # The operator presses the RESET button on the Z80 board and
-            # confirms that the serial traffic after reset is valid — a working
-            # DUT emits the expected 01 01 01 stream (see
-            # Z80Controller.check_serial_comms / VALID_COMMS_SIGNAL in
-            # Z80_driver.py). Then they press ENTER to proceed.
             if self.z80:
-                wait_for_user_with_flash(
-                    f"[{self.serial_number}] Press the Z80 RESET button and confirm valid serial "
-                    f"traffic (expected 01 01 01). Press ENTER only once traffic looks good"
-                )
-                self.logger.info("Operator confirmed Z80 serial comms. Proceeding with Step 3 data capture.")
+                # 1. Program and start RUN
+                self.logger.info("Initiating Z80 BLOAD transfer...")
+                if not self.z80.program_and_run():
+                    self.logger.error("Z80 BLOAD programming failed!")
 
-                self.logger.info(f"[{self.serial_number}] Programming Z80 & Starting Software...")
-                if self.z80.program_and_run():
-                    stage3_log = self.experiment_dir / "3_POWERED_Z80_ACTIVE" / f"{self.serial_number}_Z80_Responses.txt"
-                    self.z80.start_monitoring(stage3_log)
-                else:
-                    self.logger.error("Z80 BLOAD programming failed! Continuing acquisition loop without active serial traffic...")
+                # 2. Release wait state with kickoff byte
+                self.z80.send_kickoff()
+
+                # 3. Interactive Sync Verification (0x01, 0x01, 0x01, 0x01)
+                while True:
+                    print("\nChecking for Z80 sync signal (expecting 01 01 01 01)...")
+                    if self.z80.verify_heartbeat(count=4, timeout_s=6.0):
+                        print("\033[92;1m[Z80 SYNC VERIFIED: Received 01 01 01 01]\033[0m")
+                        self.logger.info("Z80 sync validated successfully.")
+                        break
+                    
+                    print("\033[91;1m[WARNING] Sync bytes (01 01 01 01) not observed from Z80!\033[0m")
+                    choice = input("Select action: [R]etry handshake, [P]roceed anyway, or [A]bort test? ").strip().lower()
+                    if choice == 'a':
+                        raise KeyboardInterrupt("Test run aborted by user due to missing Z80 sync.")
+                    elif choice == 'p':
+                        self.logger.warning("Proceeding with Step 3 without validated Z80 sync.")
+                        break
+                    # If 'r', loop runs verify_heartbeat again
+
+                # 4. Begin continuous logging to <experiment_name>_z80_traffic.txt
+                self.logger.info(f"Logging Z80 traffic to: {self.z80_traffic_file.name}")
+                self.z80.start_monitoring(self.z80_traffic_file)
             else:
-                self.logger.warning("No Z80 driver available; running Step 3 without Z80 traffic.")
+                self.logger.warning("No Z80 controller active. Skipping Z80 programming and traffic capture.")
 
             # ----------------------------------------------------
             # STAGE 3: POWERED + Z80 ACTIVE
@@ -292,22 +308,18 @@ class Z80ExperimentRunner:
             # ----------------------------------------------------
             # PROMPT 3 -> 4
             # ----------------------------------------------------
-            wait_for_user_with_flash(f"[{self.serial_number}] Step 3 Complete -> Enable Cooling for Step 4")
+            wait_for_user_with_flash(f"[{self.serial_number}] Step 3 Complete -> ENABLE COOLING FOR STEP 4")
 
             # ----------------------------------------------------
             # STAGE 4: POWERED + Z80 ACTIVE + COOLING
             # ----------------------------------------------------
-            if self.z80:
-                self.z80.stop_monitoring()
-                stage4_log = self.experiment_dir / "4_POWERED_Z80_ACTIVE_COOLING" / f"{self.serial_number}_Z80_Responses.txt"
-                self.z80.start_monitoring(stage4_log)
-
+            # Z80 monitoring remains actively writing to the same root traffic file
             self.run_stage_for_duration("4_POWERED_Z80_ACTIVE_COOLING", self.step_duration_s)
 
             self.logger.info(f">>> All 4 stages finished successfully for DUT {self.serial_number}. <<<")
 
         except KeyboardInterrupt:
-            self.logger.warning("Test run aborted by operator.")
+            self.logger.warning("Test run halted by operator.")
         finally:
             if self.z80:
                 self.z80.disconnect()
@@ -321,7 +333,7 @@ class Z80ExperimentRunner:
                 self.vna.close()
             if self.plotter:
                 self.plotter.close()
-            self.logger.info(f"Sequence complete. Outputs saved in {self.experiment_dir}")
+            self.logger.info(f"Test complete. Output saved in {self.experiment_dir}")
 
 
 def parse_args():
