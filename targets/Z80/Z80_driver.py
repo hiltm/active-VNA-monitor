@@ -1,5 +1,6 @@
-# targets/z80/z80_driver.py
+# targets/Z80/Z80_driver.py
 import os
+import sys
 import time
 import serial
 import binascii
@@ -10,6 +11,7 @@ from pathlib import Path
 
 logger = logging.getLogger("VNASuite")
 
+
 class Z80Controller:
     """Headless driver for Z80 Single Board Computer (BLOAD, execution, and traffic logging)."""
 
@@ -17,7 +19,7 @@ class Z80Controller:
         self,
         port: str,
         baud_rate: int = 9600,
-        binary_path: str = "targets/z80/firmware/test_payload.bin",
+        binary_path: str = "targets/Z80/Test1Sec_ND.bin",
         binary_addr: str = "0800",
         kickoff_byte: int = 5,
         step_timeout_s: float = 5.0,
@@ -40,7 +42,7 @@ class Z80Controller:
         """Opens the serial port to the Z80."""
         if self._ser is None or not self._ser.is_open:
             self._ser = serial.Serial(self.port, self.baud_rate, timeout=1.0)
-            time.sleep(1.0)  # Allow port and board to settle
+            time.sleep(1.0)  # Allow port and board logic to settle
             logger.info(f"Connected to Z80 on {self.port} @ {self.baud_rate} baud")
 
     def disconnect(self):
@@ -50,59 +52,6 @@ class Z80Controller:
             self._ser.close()
             logger.info("Closed Z80 serial connection.")
         self._ser = None
-
-    # Signal that indicates the Z80/DUT is working correctly.
-    # After the board is reset it emits a stream of 0x01 bytes
-    # (e.g. 01 01 01) on the serial link. Seeing this pattern means the
-    # DUT is alive and communicating as expected.
-    VALID_COMMS_SIGNAL = bytes([0x01, 0x01, 0x01])
-
-    def check_serial_comms(self, listen_s: float | None = None) -> bool:
-        """Passively verify the Z80/DUT serial link is producing valid traffic.
-
-        The working DUT emits a stream of 0x01 bytes (e.g. 01 01 01) after a
-        reset. This method just listens on the port (it does NOT send any
-        command) and reports whether that expected 0x01 traffic is seen.
-
-        Returns True when valid 0x01 traffic is observed, False otherwise.
-        Intended as an optional aid; the operator visually confirms traffic
-        after pressing the Z80 reset button.
-        """
-        try:
-            self.connect()
-        except Exception as e:
-            logger.error(f"Z80 comms check: could not open serial port {self.port}: {e}")
-            return False
-
-        window = listen_s if listen_s is not None else self.step_timeout_s
-        accumulated = b''
-        deadline = time.time() + window
-        while time.time() < deadline:
-            try:
-                if self._ser and self._ser.in_waiting > 0:
-                    accumulated += self._ser.read_all()
-            except Exception as e:
-                logger.error(f"Z80 comms check: read error: {e}")
-                return False
-            time.sleep(0.05)
-
-        if not accumulated:
-            logger.warning("Z80 comms check: no serial traffic seen (link may be idle or dead).")
-            return False
-
-        # Expected valid traffic: 0x01 bytes (the 01 01 01 pattern).
-        if any(b == 0x01 for b in accumulated):
-            logger.info(
-                f"Z80 comms check: valid 0x01 traffic observed "
-                f"({' '.join(f'{b:02x}' for b in accumulated[:8])}...). DUT is communicating."
-            )
-            return True
-
-        logger.warning(
-            f"Z80 comms check: traffic seen but no expected 0x01 bytes "
-            f"({' '.join(f'{b:02x}' for b in accumulated[:8])}...)."
-        )
-        return False
 
     def _write_command(self, cmd_text: str):
         """Writes a line command terminated with CR."""
@@ -178,22 +127,56 @@ class Z80Controller:
             logger.error(f"Error programming Z80: {e}")
             return False
 
+    def send_kickoff(self):
+        """Sends the kickoff byte (default 0x05) to release the Z80 execution loop."""
+        if self.kickoff_byte is not None and self._ser and self._ser.is_open:
+            try:
+                self._ser.write(bytes([self.kickoff_byte]))
+                logger.info(f"Sent kickoff byte (0x{self.kickoff_byte:02x}) to Z80.")
+                if self.response_file:
+                    ts = datetime.datetime.now().strftime("%d-%b-%Y %H:%M:%S.%f")
+                    with open(self.response_file, 'a') as f:
+                        f.write(f"Time: {ts} Data: Sent: {self.kickoff_byte:02x}\n")
+            except Exception as e:
+                logger.error(f"Failed sending kickoff byte: {e}")
+
+    def verify_heartbeat(self, count: int = 4, timeout_s: float = 6.0) -> bool:
+        """
+        Listens for the periodic Z80 heartbeat (0x01).
+        Returns True once `count` occurrences of 0x01 are confirmed, False on timeout.
+        """
+        if self._ser is None or not self._ser.is_open:
+            logger.error("Cannot verify heartbeat: port is closed.")
+            return False
+
+        logger.info(f"Listening for {count} sync bytes (0x01) within {timeout_s:.1f}s...")
+        received_ones = 0
+        deadline = time.time() + timeout_s
+
+        while time.time() < deadline:
+            if self._ser.in_waiting > 0:
+                chunk = self._ser.read(self._ser.in_waiting)
+                for b in chunk:
+                    if b == 0x01:
+                        received_ones += 1
+                        logger.info(f"Received sync byte ({received_ones}/{count}): 0x01")
+                        if received_ones >= count:
+                            return True
+                    else:
+                        logger.debug(f"Received other byte: 0x{b:02x}")
+            time.sleep(0.05)
+
+        logger.warning(f"Sync check incomplete: received {received_ones}/{count} sync bytes.")
+        return False
+
     def start_monitoring(self, response_file_path: Path):
         """Spins up a background worker to stream raw Z80 traffic to disk."""
         self.response_file = Path(response_file_path)
         self.response_file.parent.mkdir(parents=True, exist_ok=True)
         self._stop_monitor.clear()
 
-        # Send kickoff byte to start execution loop
-        if self.kickoff_byte is not None and self._ser:
-            try:
-                self._ser.write(bytes([self.kickoff_byte]))
-                ts = datetime.datetime.now().strftime("%d-%b-%Y %H:%M:%S.%f")
-                with open(self.response_file, 'a') as f:
-                    f.write(f"Time: {ts} Data: Sent: {self.kickoff_byte:02x}\n")
-                logger.info(f"Sent kickoff byte (0x{self.kickoff_byte:02x}) to Z80.")
-            except Exception as e:
-                logger.error(f"Failed sending kickoff byte: {e}")
+        # Issue kickoff byte
+        self.send_kickoff()
 
         def _monitor_worker():
             logger.info("Z80 traffic monitor thread active.")
@@ -220,3 +203,72 @@ class Z80Controller:
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=2.0)
         self._monitor_thread = None
+
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S"
+    )
+
+    parser = argparse.ArgumentParser(description="Standalone Z80 Controller Test")
+    parser.add_argument("--port", type=str, default="/dev/ttyUSB0", help="Serial port (default: /dev/ttyUSB0)")
+    parser.add_argument("--baud", type=int, default=9600, help="Baud rate (default: 9600)")
+    parser.add_argument(
+        "--bin", 
+        type=str, 
+        default=str(Path(__file__).parent / "Test1Sec_ND.bin"),
+        help="Path to Z80 binary payload"
+    )
+    parser.add_argument("--skip-bload", action="store_true", help="Skip BLOAD and only monitor serial traffic")
+    args = parser.parse_args()
+
+    print(f"Testing Z80 controller on {args.port} @ {args.baud} baud...")
+    z80 = Z80Controller(
+        port=args.port,
+        baud_rate=args.baud,
+        binary_path=args.bin,
+        binary_addr="0800",
+        kickoff_byte=5
+    )
+
+    try:
+        z80.connect()
+
+        if not args.skip_bload:
+            print("\n--- Starting BLOAD Transfer ---")
+            success = z80.program_and_run()
+            if not success:
+                print("[ERROR] BLOAD programming failed.")
+                sys.exit(1)
+            print("[SUCCESS] BLOAD finished and RUN issued.")
+
+        # Heartbeat verification
+        z80.send_kickoff()
+        print("\n--- Verifying Z80 Heartbeat (01 01 01 01) ---")
+        if z80.verify_heartbeat(count=4, timeout_s=6.0):
+            print("[SUCCESS] Z80 verified active and transmitting heartbeats!")
+        else:
+            print("[WARNING] Did not observe 4 heartbeat bytes within timeout.")
+
+        print("\n--- Monitoring Z80 Responses (Press Ctrl+C to stop) ---")
+        log_file = Path("z80_debug_traffic.txt")
+        z80.start_monitoring(log_file)
+
+        while True:
+            time.sleep(0.5)
+            if log_file.exists():
+                with open(log_file, "r") as f:
+                    lines = f.readlines()
+                    if lines:
+                        last_line = lines[-1].strip()
+                        print(f"Latest traffic: {last_line}")
+
+    except KeyboardInterrupt:
+        print("\n\nTest stopped by user.")
+    finally:
+        z80.disconnect()
+        print("Z80 port closed.")
