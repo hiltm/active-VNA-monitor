@@ -111,7 +111,8 @@ class ExperimentTelemetryLogger:
         "rtd_current_a", "rtd_voltage_v", "rtd_phase", "dut_voltage_v", 
         "dut_current_ma", "dut_power_mw",
         "ml_class", "ml_label", "ml_confidence",
-        "ml_prob_fresh", "ml_prob_light_aged", "ml_prob_heavy_aged"
+        "ml_prob_fresh", "ml_prob_light_aged", "ml_prob_heavy_aged",
+        "blockchain_tx"
     ]
 
     def __init__(self, output_dir: Path, experiment_name: str, config_snapshot: dict):
