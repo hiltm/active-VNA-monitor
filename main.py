@@ -88,7 +88,10 @@ class ExperimentController:
                             stable_samples=self.cfg.rtd_stable_samples,
                             kp=self.cfg.rtd_kp,
                             ki=self.cfg.rtd_ki,
-                            kd=self.cfg.rtd_kd
+                            kd=self.cfg.rtd_kd,
+                            measure_samples=self.cfg.rtd_measure_samples,
+                            sample_spacing_s=self.cfg.rtd_sample_spacing_s,
+                            measure_settle_seconds=self.cfg.rtd_measure_settle_seconds,
                         )
                     else:
                         self.heater.psu = self.psu

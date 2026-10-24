@@ -74,16 +74,22 @@ class RTDHeaterController:
 
     # ---- Phase timing (wall clock, independent of update_tick call rate) ----
     HEAT_SECONDS = 4.0            # s, duration of each heat phase
-    MEASURE_SECONDS = 1.5         # s, duration of each measure phase
-    MEASURE_SETTLE_SECONDS = 1.0  # s, wait after dropping to excitation before sampling
+    MEASURE_SECONDS = 1.0         # s, duration of each measure phase
+    MEASURE_SETTLE_SECONDS = 0.5  # s, wait after dropping to excitation before sampling
 
     # Transient rejection by median sampling: at the end of the settle window we
-    # take several quick raw V/I samples and use their MEDIAN. A one-off settling
+    # take a few quick raw V/I samples and use their MEDIAN. A one-off settling
     # transient (unsettled PSU readback after a current change) shows up as an
     # outlier that the median discards, while the true value is the majority. No
     # history or reference value is needed, so there is no stale-reference risk.
-    MEASURE_SAMPLES = 5           # raw samples per measurement (odd number)
-    SAMPLE_SPACING_S = 0.05       # s between raw samples
+    #
+    # NOTE on loop cost: each raw sample is two blocking serial round-trips to
+    # the PSU, and these run inside the synchronous main loop (ahead of the VNA
+    # sweep). Keep MEASURE_SAMPLES small and SAMPLE_SPACING_S at/near zero to
+    # avoid slowing the VNA cadence. 3 samples with no spacing still rejects a
+    # single isolated outlier. These are overridable from config.
+    MEASURE_SAMPLES = 3           # raw samples per measurement (odd number)
+    SAMPLE_SPACING_S = 0.0        # s between raw samples (0 = back-to-back)
 
     # Physical plausibility: a real element cannot lose this many degrees in one
     # cycle. A larger apparent drop is a bad reading and must never be allowed to
@@ -102,6 +108,12 @@ class RTDHeaterController:
         stable_samples: int = 3,
         # kp/ki/kd kept in the signature for config/backward compatibility; unused now.
         kp: float = 0.0020, ki: float = 0.0010, kd: float = 0.0000,
+        # Measurement-cost knobs (None = use class defaults). These directly
+        # affect how long each measure cycle blocks the main loop before the VNA
+        # sweep, so they are exposed for tuning VNA cadence vs. noise rejection.
+        measure_samples: int | None = None,
+        sample_spacing_s: float | None = None,
+        measure_settle_seconds: float | None = None,
         log_writer=None, log_file=None,
     ):
         self.psu = psu
@@ -111,6 +123,14 @@ class RTDHeaterController:
         self.stable_samples = int(stable_samples)
         self._log_writer = log_writer
         self._log_file = log_file
+
+        # Override measurement-cost knobs if provided (else keep class defaults).
+        if measure_samples is not None:
+            self.MEASURE_SAMPLES = int(measure_samples)
+        if sample_spacing_s is not None:
+            self.SAMPLE_SPACING_S = float(sample_spacing_s)
+        if measure_settle_seconds is not None:
+            self.MEASURE_SETTLE_SECONDS = float(measure_settle_seconds)
 
         # Heating-current ramp state
         self._heat_current = self.MIN_HEATER_CURRENT

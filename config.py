@@ -64,3 +64,9 @@ class AppConfig:
     rtd_kp: float = 0.0020
     rtd_ki: float = 0.0010
     rtd_kd: float = 0.0000
+    # Measurement-cost knobs. Each raw sample is two blocking serial reads to the
+    # PSU inside the main loop (before the VNA sweep), so these trade VNA cadence
+    # against temperature-reading noise rejection. Lower = faster loop.
+    rtd_measure_samples: int = 3          # raw V/I samples per reading (odd; median of these)
+    rtd_sample_spacing_s: float = 0.0     # s between raw samples (0 = back-to-back)
+    rtd_measure_settle_seconds: float = 0.5  # s to wait after dropping to excitation current
