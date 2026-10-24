@@ -74,8 +74,21 @@ class RTDHeaterController:
 
     # ---- Phase timing (wall clock, independent of update_tick call rate) ----
     HEAT_SECONDS = 4.0            # s, duration of each heat phase
-    MEASURE_SECONDS = 1.0         # s, duration of each measure phase
-    MEASURE_SETTLE_SECONDS = 0.4  # s, wait after dropping to excitation before sampling
+    MEASURE_SECONDS = 1.5         # s, duration of each measure phase
+    MEASURE_SETTLE_SECONDS = 1.0  # s, wait after dropping to excitation before sampling
+
+    # Transient rejection by median sampling: at the end of the settle window we
+    # take several quick raw V/I samples and use their MEDIAN. A one-off settling
+    # transient (unsettled PSU readback after a current change) shows up as an
+    # outlier that the median discards, while the true value is the majority. No
+    # history or reference value is needed, so there is no stale-reference risk.
+    MEASURE_SAMPLES = 5           # raw samples per measurement (odd number)
+    SAMPLE_SPACING_S = 0.05       # s between raw samples
+
+    # Physical plausibility: a real element cannot lose this many degrees in one
+    # cycle. A larger apparent drop is a bad reading and must never be allowed to
+    # increase the heating current.
+    IMPLAUSIBLE_DROP_DT = 20.0    # degC per cycle
 
     LOOP_PERIOD = 5.0             # s, nominal full heat+measure cycle (for reference)
     SAFETY_MAX_TEMP = 130.0       # degC, hard overtemp cutoff
@@ -129,8 +142,8 @@ class RTDHeaterController:
         self._measure_sampled = False
 
     # ------------------------------------------------------------ measurement
-    def _read_temperature_at(self, excitation_current: float):
-        """Read V/I at a known current and convert to temperature."""
+    def _read_once_at(self, excitation_current: float):
+        """One raw V/I reading -> (temperature, resistance, amps, volts)."""
         volts = self.psu.measure_voltage(self.CHANNEL)
         amps = self.psu.measure_current(self.CHANNEL)
         # Fall back to the commanded current if the readback is too small to trust.
@@ -139,6 +152,25 @@ class RTDHeaterController:
         resistance = volts / amps if amps > 0 else 0.0
         temperature = resistance_to_temperature(resistance)
         return temperature, resistance, amps, volts
+
+    def _read_temperature_at(self, excitation_current: float):
+        """Median-filtered V/I measurement.
+
+        Takes MEASURE_SAMPLES raw readings and returns the sample whose
+        resistance is the median. Using the median of raw samples rejects an
+        isolated settling transient at the source, so a single bad readback can
+        never drive the control loop. Returns (temperature, resistance, amps,
+        volts) for the chosen (median) sample.
+        """
+        samples = []
+        for i in range(self.MEASURE_SAMPLES):
+            samples.append(self._read_once_at(excitation_current))
+            if i < self.MEASURE_SAMPLES - 1:
+                time.sleep(self.SAMPLE_SPACING_S)
+        # Pick the sample at the median resistance (robust to outliers).
+        samples.sort(key=lambda s: s[1])
+        median = samples[len(samples) // 2]
+        return median
 
     def measure_temperature(self) -> tuple[float, float, float]:
         """
@@ -161,6 +193,14 @@ class RTDHeaterController:
         keep raising current toward the cap instead of prematurely holding.
         """
         error = setpoint - temp
+
+        # Physical-plausibility guard: a heated element with real thermal mass
+        # cannot drop many degrees in a single ~5 s cycle. A large negative dT is
+        # therefore a bad reading, not reality. Never let such a spike command
+        # MORE current (the dangerous direction). Freeze current and wait for the
+        # next median-filtered reading to confirm the true temperature.
+        if delta_t is not None and delta_t <= -self.IMPLAUSIBLE_DROP_DT:
+            return f"ramp {self.step_idx + 1} (implausible drop dT={delta_t:+.1f}, I frozen)"
 
         if error > self.tolerance:
             # If the temperature is still climbing hard from the last push, hold
@@ -241,22 +281,31 @@ class RTDHeaterController:
             if not self._measure_sampled:
                 temp, resistance, amps, volts = self._read_temperature_at(self.EXCITATION_CURRENT)
                 delta_t = None if self._last_temp is None else (temp - self._last_temp)
+                self._measure_sampled = True
+                self._cycle_count += 1
+
+                # Safety first: honor an over-temperature reading even if it also
+                # looks like a glitch. A false trip here is the safe failure mode.
+                if temp >= self.SAFETY_MAX_TEMP:
+                    logger.error(
+                        f"SAFETY CUTOFF: {temp:.2f}degC exceeds limit. Clamping to excitation current."
+                    )
+                    self._prev_temp = self._last_temp
+                    self._last_temp = temp
+                    self._last_resistance = resistance
+                    self._last_meas_current = amps
+                    self._last_meas_volts = volts
+                    self._heat_current = self.MIN_HEATER_CURRENT
+                    self.psu.set_current(self.CHANNEL, self.EXCITATION_CURRENT)
+                    return self._status(setpoint, phase="OVERTEMP")
+
+                # The reading is median-filtered at the source, so transients are
+                # already rejected. Accept it directly.
                 self._prev_temp = self._last_temp
                 self._last_temp = temp
                 self._last_resistance = resistance
                 self._last_meas_current = amps
                 self._last_meas_volts = volts
-                self._measure_sampled = True
-                self._cycle_count += 1
-
-                # Safety first.
-                if temp >= self.SAFETY_MAX_TEMP:
-                    logger.error(
-                        f"SAFETY CUTOFF: {temp:.2f}degC exceeds limit. Clamping to excitation current."
-                    )
-                    self._heat_current = self.MIN_HEATER_CURRENT
-                    self.psu.set_current(self.CHANNEL, self.EXCITATION_CURRENT)
-                    return self._status(setpoint, phase="OVERTEMP")
 
                 # Decide next heat current and advance the step schedule.
                 phase_label = self._adjust_heat_current(temp, setpoint, delta_t)
@@ -264,8 +313,6 @@ class RTDHeaterController:
                 self._pending_phase_label = phase_label
 
                 # Rich per-cycle tuning line (one per measure cycle).
-                # Delivered heating power is estimated at the *heat* current the
-                # next heat phase will apply, into the just-measured resistance.
                 heat_power = self._heat_current ** 2 * resistance
                 dt_str = "  n/a" if delta_t is None else f"{delta_t:+5.2f}"
                 logger.info(
