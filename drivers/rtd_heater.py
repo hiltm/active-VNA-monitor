@@ -1,9 +1,6 @@
 # drivers/rtd_heater.py
 import time
-import datetime
-import csv
 import logging
-from simple_pid import PID
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +13,7 @@ PT100_TABLE = {
     210: 179.51, 220: 183.17, 230: 186.82, 239: 190.09,
 }
 _R_TO_T = sorted((r, t) for t, r in PT100_TABLE.items())
+
 
 def resistance_to_temperature(ohms: float) -> float:
     """Linearly interpolate the PT100 table to convert Ohms -> degC."""
@@ -33,12 +31,41 @@ def resistance_to_temperature(ohms: float) -> float:
 
 
 class RTDHeaterController:
+    """
+    Drives a single PT100 element that is used BOTH as a heater and as a
+    temperature sensor on PSU channel 1.
+
+    Because one element cannot heat and be measured accurately at the same
+    instant, the loop time-multiplexes two phases driven off a wall clock:
+
+      * HEAT    - push a (ramped) heating current through the PT100. Power is
+                  I^2 * R, so current is the natural control knob. The voltage
+                  limit is held high as a compliance ceiling.
+      * MEASURE - drop to a small, fixed excitation current (~1 mA) so that
+                  self-heating is negligible, let the reading settle, then read
+                  V/I to get the true resistance -> temperature.
+
+    The heating current is ramped up incrementally toward the active setpoint
+    (final step = 120 degC) and held/trimmed once inside the tolerance band,
+    bounded by hard current/voltage ceilings the user can raise experimentally.
+    """
+
     CHANNEL = 1
-    DRIVE_VOLTAGE_LIMIT = 20.0    # V compliance ceiling
-    MIN_CURRENT = 0.050           # A (50 mA floor for readback resolution)
-    MAX_HEATER_CURRENT = 0.100    # A (100 mA safety cap)
-    LOOP_PERIOD = 5.0             # s
-    SAFETY_MAX_TEMP = 130.0       # degC
+
+    # ---- Drive limits (raise MAX_HEATER_CURRENT experimentally for your element) ----
+    DRIVE_VOLTAGE_LIMIT = 20.0    # V, compliance ceiling during the heat phase
+    EXCITATION_CURRENT = 0.001    # A, 1 mA known current used only for measuring
+    MIN_HEATER_CURRENT = 0.010    # A, lowest heating current the ramp starts from
+    MAX_HEATER_CURRENT = 0.100    # A, hard safety cap on heating current
+    CURRENT_STEP = 0.005          # A, how much to raise/lower current per decision
+
+    # ---- Phase timing (wall clock, independent of update_tick call rate) ----
+    HEAT_SECONDS = 4.0            # s, duration of each heat phase
+    MEASURE_SECONDS = 1.0         # s, duration of each measure phase
+    MEASURE_SETTLE_SECONDS = 0.4  # s, wait after dropping to excitation before sampling
+
+    LOOP_PERIOD = 5.0             # s, nominal full heat+measure cycle (for reference)
+    SAFETY_MAX_TEMP = 130.0       # degC, hard overtemp cutoff
 
     def __init__(
         self,
@@ -47,90 +74,187 @@ class RTDHeaterController:
         dwell_seconds: float = 600.0,
         tolerance: float = 1.0,
         stable_samples: int = 3,
+        # kp/ki/kd kept in the signature for config/backward compatibility; unused now.
         kp: float = 0.0020, ki: float = 0.0010, kd: float = 0.0000,
-        log_writer=None, log_file=None
+        log_writer=None, log_file=None,
     ):
         self.psu = psu
         self.steps = list(steps)
         self.dwell_seconds = float(dwell_seconds)
         self.tolerance = float(tolerance)
         self.stable_samples = int(stable_samples)
-        self._last_set_current = self.MIN_CURRENT
         self._log_writer = log_writer
         self._log_file = log_file
 
-        self.pid = PID(
-            Kp=kp, Ki=ki, Kd=kd,
-            setpoint=self.steps[0],
-            sample_time=self.LOOP_PERIOD,
-            output_limits=(self.MIN_CURRENT, self.MAX_HEATER_CURRENT),
-        )
+        # Heating-current ramp state
+        self._heat_current = self.MIN_HEATER_CURRENT
+        self._last_temp = None          # most recent valid measurement (degC)
+        self._last_resistance = None
+        self._last_meas_current = self.EXCITATION_CURRENT
+
+        # Phase machine state
+        self._phase = "heat"            # "heat" or "measure"
+        self._phase_started = None      # wall-clock monotonic timestamp
+        self._measure_sampled = False   # whether we've taken this cycle's reading
+
+        # Setpoint schedule state (unchanged semantics)
         self.step_idx = 0
         self.arrived = False
         self.stable_count = 0
         self.dwell_start = None
 
+    # ------------------------------------------------------------------ setup
     def initialize_hardware(self):
         self.psu.set_voltage(self.CHANNEL, self.DRIVE_VOLTAGE_LIMIT)
-        self.psu.set_current(self.CHANNEL, self.MIN_CURRENT)
+        self.psu.set_current(self.CHANNEL, self._heat_current)
         self.psu.output_on()
+        self._phase = "heat"
+        self._phase_started = time.monotonic()
+        self._measure_sampled = False
 
-    def measure_temperature(self) -> tuple[float, float, float]:
-        """Returns (temperature_degC, resistance_ohm, current_A)."""
+    # ------------------------------------------------------------ measurement
+    def _read_temperature_at(self, excitation_current: float):
+        """Read V/I at a known current and convert to temperature."""
         volts = self.psu.measure_voltage(self.CHANNEL)
         amps = self.psu.measure_current(self.CHANNEL)
+        # Fall back to the commanded current if the readback is too small to trust.
         if amps < 0.0005:
-            amps = self._last_set_current
+            amps = excitation_current
         resistance = volts / amps if amps > 0 else 0.0
         temperature = resistance_to_temperature(resistance)
-        return temperature, resistance, amps
+        return temperature, resistance, amps, volts
 
-    def update_tick(self, t_now: float) -> dict:
-        """Non-blocking single cycle execution (ideal for main loop integration)."""
-        temp, resistance, amps = self.measure_temperature()
-        volts = self.psu.measure_voltage(self.CHANNEL)
+    def measure_temperature(self) -> tuple[float, float, float]:
+        """
+        Backward-compatible helper: returns (temp, resistance, current).
+        Returns the last valid multiplexed measurement when available so callers
+        never see a reading taken mid heat phase.
+        """
+        if self._last_temp is not None:
+            return self._last_temp, self._last_resistance, self._last_meas_current
+        temp, resistance, amps, _ = self._read_temperature_at(self.EXCITATION_CURRENT)
+        return temp, resistance, amps
 
-        # Safety clamp
-        if temp >= self.SAFETY_MAX_TEMP:
-            logger.error(f"SAFETY CUTOFF: {temp:.2f}°C exceeds limit. Clamping current.")
-            self.psu.set_current(self.CHANNEL, self.MIN_CURRENT)
-            return {"temp": temp, "phase": "OVERTEMP"}
-
-        setpoint = self.steps[self.step_idx]
+    # ----------------------------------------------------------- ramp control
+    def _adjust_heat_current(self, temp: float, setpoint: float) -> str:
+        """Ramp heating current toward the setpoint; return a phase label."""
         error = setpoint - temp
-        new_current = self.pid(temp)
-        self._last_set_current = new_current
-        self.psu.set_current(self.CHANNEL, new_current)
 
-        # Step schedule state machine
+        if error > self.tolerance:
+            # Below target: push harder, bounded by the hard cap.
+            self._heat_current = min(
+                self._heat_current + self.CURRENT_STEP, self.MAX_HEATER_CURRENT
+            )
+            if self._heat_current >= self.MAX_HEATER_CURRENT:
+                return f"ramp {self.step_idx + 1} (I at cap {self.MAX_HEATER_CURRENT*1000:.0f}mA)"
+            return f"ramp {self.step_idx + 1}"
+        elif error < -self.tolerance:
+            # Above target: back off.
+            self._heat_current = max(
+                self._heat_current - self.CURRENT_STEP, self.MIN_HEATER_CURRENT
+            )
+            return f"cool {self.step_idx + 1}"
+        else:
+            # Inside the band: hold.
+            return f"hold {self.step_idx + 1}"
+
+    def _advance_schedule(self, temp: float, setpoint: float, t_now: float):
+        """Stepped setpoint + dwell state machine (unchanged semantics)."""
+        error = setpoint - temp
         if not self.arrived:
             if abs(error) <= self.tolerance:
                 self.stable_count += 1
-                phase = f"settle {self.stable_count}/{self.stable_samples}"
                 if self.stable_count >= self.stable_samples:
                     self.arrived = True
                     self.dwell_start = t_now
-                    logger.info(f"Step {self.step_idx+1} reached ({setpoint}°C). Dwelling {self.dwell_seconds}s.")
+                    logger.info(
+                        f"Step {self.step_idx + 1} reached ({setpoint}degC). "
+                        f"Dwelling {self.dwell_seconds}s."
+                    )
             else:
                 self.stable_count = 0
-                phase = f"ramp {self.step_idx+1}"
         else:
             remaining = self.dwell_seconds - (t_now - self.dwell_start)
-            if remaining <= 0:
-                if self.step_idx + 1 < len(self.steps):
-                    self.step_idx += 1
-                    self.arrived = False
-                    self.stable_count = 0
-                    self.dwell_start = None
-                    self.pid.setpoint = self.steps[self.step_idx]
-                    phase = f"ramp {self.step_idx+1}"
-                else:
-                    phase = "hold-final"
-            else:
-                phase = f"dwell {remaining:.0f}s"
+            if remaining <= 0 and self.step_idx + 1 < len(self.steps):
+                self.step_idx += 1
+                self.arrived = False
+                self.stable_count = 0
+                self.dwell_start = None
+                logger.info(f"Advancing to step {self.step_idx + 1} ({self.steps[self.step_idx]}degC).")
 
+    # ------------------------------------------------------------------- tick
+    def update_tick(self, t_now: float) -> dict:
+        """
+        Non-blocking single cycle. Call as often as the main loop runs; phase
+        transitions are driven off wall-clock time, not call count.
+        """
+        now = time.monotonic()
+        if self._phase_started is None:
+            self._phase_started = now
+        elapsed = now - self._phase_started
+        setpoint = self.steps[self.step_idx]
+
+        # ---------------------------------------------------- MEASURE phase
+        if self._phase == "measure":
+            # Command the small excitation current the moment we enter the phase.
+            if not self._measure_sampled and elapsed < self.MEASURE_SETTLE_SECONDS:
+                self.psu.set_current(self.CHANNEL, self.EXCITATION_CURRENT)
+                return self._status(setpoint, phase=f"measure-settle {self.step_idx + 1}")
+
+            # After settling, take exactly one reading for this cycle.
+            if not self._measure_sampled:
+                temp, resistance, amps, volts = self._read_temperature_at(self.EXCITATION_CURRENT)
+                self._last_temp = temp
+                self._last_resistance = resistance
+                self._last_meas_current = amps
+                self._measure_sampled = True
+
+                # Safety first.
+                if temp >= self.SAFETY_MAX_TEMP:
+                    logger.error(
+                        f"SAFETY CUTOFF: {temp:.2f}degC exceeds limit. Clamping to excitation current."
+                    )
+                    self._heat_current = self.MIN_HEATER_CURRENT
+                    self.psu.set_current(self.CHANNEL, self.EXCITATION_CURRENT)
+                    return self._status(setpoint, phase="OVERTEMP")
+
+                # Decide next heat current and advance the step schedule.
+                phase_label = self._adjust_heat_current(temp, setpoint)
+                self._advance_schedule(temp, setpoint, t_now)
+                self._pending_phase_label = phase_label
+
+            # Stay in measure until the window elapses, then switch to heat.
+            if elapsed >= self.MEASURE_SECONDS:
+                self._phase = "heat"
+                self._phase_started = now
+                self.psu.set_current(self.CHANNEL, self._heat_current)
+
+            return self._status(
+                setpoint, phase=getattr(self, "_pending_phase_label", f"ramp {self.step_idx + 1}")
+            )
+
+        # ------------------------------------------------------- HEAT phase
+        # Ensure the commanded heating current is applied.
+        self.psu.set_current(self.CHANNEL, self._heat_current)
+        if elapsed >= self.HEAT_SECONDS:
+            self._phase = "measure"
+            self._phase_started = now
+            self._measure_sampled = False
+
+        return self._status(setpoint, phase=f"heat {self.step_idx + 1}")
+
+    # ----------------------------------------------------------------- status
+    def _status(self, setpoint: float, phase: str) -> dict:
+        """Build the return dict using the last valid measurement."""
+        temp = self._last_temp
+        resistance = self._last_resistance
+        error = (setpoint - temp) if temp is not None else None
         return {
-            "time_s": t_now, "setpoint": setpoint, "temp": temp,
-            "resistance": resistance, "amps": amps, "volts": volts,
-            "error": error, "phase": phase
+            "setpoint": setpoint,
+            "temp": temp,
+            "resistance": resistance,
+            "amps": self._heat_current,          # commanded heating current
+            "volts": self.DRIVE_VOLTAGE_LIMIT,   # compliance ceiling
+            "error": error,
+            "phase": phase,
         }
