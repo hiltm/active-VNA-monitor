@@ -56,8 +56,21 @@ class RTDHeaterController:
     DRIVE_VOLTAGE_LIMIT = 20.0    # V, compliance ceiling during the heat phase
     EXCITATION_CURRENT = 0.001    # A, 1 mA known current used only for measuring
     MIN_HEATER_CURRENT = 0.010    # A, lowest heating current the ramp starts from
-    MAX_HEATER_CURRENT = 0.100    # A, hard safety cap on heating current
-    CURRENT_STEP = 0.005          # A, how much to raise/lower current per decision
+    MAX_HEATER_CURRENT = 0.300    # A, hard safety cap on heating current
+    CURRENT_STEP = 0.010          # A, max current increment per decision (when far off)
+    MIN_CURRENT_STEP = 0.001      # A, smallest increment used near the setpoint
+
+    # Proportional approach: the current step scales with error until the error
+    # exceeds this band, where it uses the full CURRENT_STEP. Smaller band =
+    # gentler, slower final approach with less overshoot.
+    PROPORTIONAL_BAND = 30.0      # degC
+
+    # Below this per-cycle temperature rise (degC) while still under setpoint,
+    # the element is treated as stalled and the ramp keeps pushing to the cap.
+    STALL_DELTA_T = 0.3           # degC per cycle
+    # Above this per-cycle rise, hold current steady and let temperature catch
+    # up rather than adding more current (overshoot protection).
+    FAST_RISE_DELTA_T = 8.0       # degC per cycle
 
     # ---- Phase timing (wall clock, independent of update_tick call rate) ----
     HEAT_SECONDS = 4.0            # s, duration of each heat phase
@@ -89,8 +102,11 @@ class RTDHeaterController:
         # Heating-current ramp state
         self._heat_current = self.MIN_HEATER_CURRENT
         self._last_temp = None          # most recent valid measurement (degC)
+        self._prev_temp = None          # measurement from the previous cycle (degC)
         self._last_resistance = None
         self._last_meas_current = self.EXCITATION_CURRENT
+        self._last_meas_volts = None
+        self._cycle_count = 0
 
         # Phase machine state
         self._phase = "heat"            # "heat" or "measure"
@@ -136,17 +152,37 @@ class RTDHeaterController:
         return temp, resistance, amps
 
     # ----------------------------------------------------------- ramp control
-    def _adjust_heat_current(self, temp: float, setpoint: float) -> str:
-        """Ramp heating current toward the setpoint; return a phase label."""
+    def _adjust_heat_current(self, temp: float, setpoint: float, delta_t) -> str:
+        """Ramp heating current toward the setpoint; return a phase label.
+
+        delta_t is the temperature change since the previous cycle (degC), or
+        None on the first cycle. When below setpoint but the temperature is
+        barely moving, the element has stalled at the current power level, so we
+        keep raising current toward the cap instead of prematurely holding.
+        """
         error = setpoint - temp
 
         if error > self.tolerance:
-            # Below target: push harder, bounded by the hard cap.
-            self._heat_current = min(
-                self._heat_current + self.CURRENT_STEP, self.MAX_HEATER_CURRENT
-            )
-            if self._heat_current >= self.MAX_HEATER_CURRENT:
+            # If the temperature is still climbing hard from the last push, hold
+            # current steady for a cycle and let the thermal mass catch up. This
+            # prevents stacking current faster than the element responds, which
+            # is what causes overshoot past the setpoint.
+            if delta_t is not None and delta_t >= self.FAST_RISE_DELTA_T:
+                return f"ramp {self.step_idx + 1} (settle, dT={delta_t:+.1f})"
+
+            stalled = delta_t is not None and delta_t < self.STALL_DELTA_T
+
+            # Proportional step: big increments when far from target, shrinking
+            # to a small floor as we approach so we decelerate into the band.
+            frac = min(1.0, error / self.PROPORTIONAL_BAND)
+            step = max(self.MIN_CURRENT_STEP, self.CURRENT_STEP * frac)
+            self._heat_current = min(self._heat_current + step, self.MAX_HEATER_CURRENT)
+
+            at_cap = self._heat_current >= self.MAX_HEATER_CURRENT
+            if at_cap:
                 return f"ramp {self.step_idx + 1} (I at cap {self.MAX_HEATER_CURRENT*1000:.0f}mA)"
+            if stalled:
+                return f"ramp {self.step_idx + 1} (stall-push)"
             return f"ramp {self.step_idx + 1}"
         elif error < -self.tolerance:
             # Above target: back off.
@@ -204,10 +240,14 @@ class RTDHeaterController:
             # After settling, take exactly one reading for this cycle.
             if not self._measure_sampled:
                 temp, resistance, amps, volts = self._read_temperature_at(self.EXCITATION_CURRENT)
+                delta_t = None if self._last_temp is None else (temp - self._last_temp)
+                self._prev_temp = self._last_temp
                 self._last_temp = temp
                 self._last_resistance = resistance
                 self._last_meas_current = amps
+                self._last_meas_volts = volts
                 self._measure_sampled = True
+                self._cycle_count += 1
 
                 # Safety first.
                 if temp >= self.SAFETY_MAX_TEMP:
@@ -219,9 +259,22 @@ class RTDHeaterController:
                     return self._status(setpoint, phase="OVERTEMP")
 
                 # Decide next heat current and advance the step schedule.
-                phase_label = self._adjust_heat_current(temp, setpoint)
+                phase_label = self._adjust_heat_current(temp, setpoint, delta_t)
                 self._advance_schedule(temp, setpoint, t_now)
                 self._pending_phase_label = phase_label
+
+                # Rich per-cycle tuning line (one per measure cycle).
+                # Delivered heating power is estimated at the *heat* current the
+                # next heat phase will apply, into the just-measured resistance.
+                heat_power = self._heat_current ** 2 * resistance
+                dt_str = "  n/a" if delta_t is None else f"{delta_t:+5.2f}"
+                logger.info(
+                    f"[RTD #{self._cycle_count:04d}] "
+                    f"T={temp:6.2f}degC  set={setpoint:5.1f}  err={setpoint - temp:+6.2f}  "
+                    f"dT={dt_str}degC/cyc  |  "
+                    f"I_heat={self._heat_current*1000:5.1f}mA  P={heat_power:5.2f}W  "
+                    f"R={resistance:6.2f}ohm  Vexc={volts:5.3f}V  |  {phase_label}"
+                )
 
             # Stay in measure until the window elapses, then switch to heat.
             if elapsed >= self.MEASURE_SECONDS:
