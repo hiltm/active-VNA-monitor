@@ -29,6 +29,10 @@ class AppConfig:
     # Experiment Loop Parameters
     loop_interval_seconds: float = 1.0
     base_save_dir: str = "/home/chiptamper/chiptamper/data"
+    # Local spool used only when base_save_dir (often a network mount) is
+    # unreachable. Records are written here and auto-migrated back to the primary
+    # once it returns. None -> ~/vna_fallback_data.
+    fallback_save_dir: str | None = None
     experiment_name: str = "Z80_prelim_mod3_sn30"
 
     # VNA Parameters

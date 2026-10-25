@@ -30,7 +30,10 @@ class ExperimentController:
             experiment_name=cfg.experiment_name,
             config_snapshot=dataclasses.asdict(cfg)
         )
-        self.storage = DataStorage(cfg.base_save_dir, cfg.experiment_name)
+        self.storage = DataStorage(
+            cfg.base_save_dir, cfg.experiment_name,
+            fallback_base_dir=cfg.fallback_save_dir,
+        )
 
         # Hardware & Plugin Handles
         self.vna = None
@@ -272,8 +275,13 @@ class ExperimentController:
                 )
 
                 # 6. Save Touchstone File (.s2p) & Checksum
+                # save_record returns None if neither primary nor local fallback
+                # could be written; keep the loop alive rather than crashing.
                 s2p_path = self.storage.save_record(record)
-                file_hash = ExperimentTelemetryLogger.compute_sha256(s2p_path)
+                file_hash = (
+                    ExperimentTelemetryLogger.compute_sha256(s2p_path)
+                    if s2p_path is not None else "NO_FILE"
+                )
 
                 # 7. Real-Time ML Aging Classification
                 ml_res = {
@@ -294,7 +302,7 @@ class ExperimentController:
 
                 # 8. Append Synchronized Telemetry Row
                 blockchain_tx = None
-                if self.ledger:
+                if self.ledger and s2p_path is not None:
                     blockchain_tx = self.ledger.record_measurement(
                         s2p_path=s2p_path,
                         sha256_hex=file_hash,
@@ -312,7 +320,7 @@ class ExperimentController:
                 self.telemetry.log_sweep({
                     "iso_time": t_dt.isoformat(),
                     "epoch_time": t_epoch,
-                    "touchstone_file": s2p_path.name,
+                    "touchstone_file": s2p_path.name if s2p_path is not None else "WRITE_FAILED",
                     "touchstone_sha256": file_hash,
                     "ambient_temp_c": ambient_val,
                     "rtd_setpoint_c": heater_stats.get("setpoint"),
